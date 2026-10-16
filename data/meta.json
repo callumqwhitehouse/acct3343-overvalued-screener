@@ -1,0 +1,18 @@
+{
+  "generated": "2026-10-15",
+  "n_firms": 1937,
+  "n_operating": 1500,
+  "min_mcap": 1035871486.0,
+  "fy_end_min": "2025-03-31",
+  "fy_end_max": "2026-09-03",
+  "skipped": {
+    "no_xbrl_file": 19,
+    "no_10k_data": 362,
+    "stale": 6
+  },
+  "snapshots": {
+    "current": "current",
+    "bt2024": "2024-10-15",
+    "bt2025": "2025-10-15"
+  }
+}
