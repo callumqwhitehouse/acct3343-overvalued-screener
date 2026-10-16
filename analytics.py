@@ -22,7 +22,9 @@ BENEISH = {"const": -4.84, "dsri": 0.920, "gmi": 0.528, "aqi": 0.404, "sgi": 0.8
            "depi": 0.115, "sgai": -0.172, "tata": 4.679, "lvgi": -0.327}
 M_SCORE_CUTOFF = -1.78
 ADJACENT_DAYS = (330, 400)  # consecutive fiscal years (52/53-week years included)
-MAJOR_CHANGE = (0.7, 1.5)  # latest-quarter assets / 10-K assets outside this band -> flagged
+# Corporate separations announced/completed after the latest 10-K that the filings cannot reveal yet
+# (manually reviewed for the current snapshot only).
+KNOWN_SEPARATIONS = {"CTVA", "HON", "CMCSA"}
 
 # Value measures: higher = cheaper.  Quality measures: higher = better.
 VALUE_METRICS = {
@@ -54,12 +56,14 @@ def _norm_cdf(x: pd.Series) -> pd.Series:
 # Metrics
 # ---------------------------------------------------------------------------
 def compute_metrics(panel: pd.DataFrame, firms: pd.DataFrame, mcap: pd.Series,
-                    lookback: int = 8, latest: pd.DataFrame | None = None) -> pd.DataFrame:
+                    lookback: int = 8, latest: pd.DataFrame | None = None,
+                    known_separations: set[str] | None = None) -> pd.DataFrame:
     """One row per firm.
 
     mcap   : market cap indexed by cik (today or the formation date).
-    latest : optional frame indexed by cik with q_end / q_assets (most recent balance
-             sheet from any 10-Q/10-K) used to flag spin-offs and mergers after the 10-K.
+    latest : optional frame indexed by cik with q_end / q_assets / shares / shares_10k (most
+             recent balance sheet and share counts) used to flag spin-offs and mergers after the 10-K.
+    known_separations : tickers whose price no longer matches their last 10-K (current snapshot).
     """
     p = panel.sort_values(["cik", "fy_end"]).copy()
     if "gp_source" not in p:
@@ -95,12 +99,20 @@ def compute_metrics(panel: pd.DataFrame, firms: pd.DataFrame, mcap: pd.Series,
     ta, ca, cl = cur["total_assets"], cur["current_assets"], cur["current_liab"]
 
     # Spin-offs / mergers after the 10-K: price reflects a different company than the statements.
+    # Flag: assets shrank by > 30% (spin-off/divestiture), or grew > 50% with > 15% more shares
+    # (stock-funded merger), or more than tripled. Fast organic growth alone is not flagged.
     m["post_fy_asset_ratio"] = np.nan
+    m["share_growth"] = np.nan
     if latest is not None:
         lt_ = latest.reindex(cur.index)
         later = lt_["q_end"] > cur["fy_end"]
         m["post_fy_asset_ratio"] = _div(lt_["q_assets"], ta, True).where(later)
-    m["major_change"] = ~m["post_fy_asset_ratio"].between(*MAJOR_CHANGE) & m["post_fy_asset_ratio"].notna()
+        if "shares_10k" in lt_:
+            m["share_growth"] = _div(lt_["shares"], lt_["shares_10k"], True)
+    r, sg = m["post_fy_asset_ratio"], m["share_growth"]
+    m["major_change"] = ((r < 0.7) | ((r > 1.5) & (sg > 1.15)) | (r > 3)).fillna(False)
+    if known_separations:
+        m.loc[m.index.isin(firms.loc[firms["ticker"].isin(known_separations), "cik"]), "major_change"] = True
 
     # ---- Ch 2: magic formula + quality/price --------------------------------
     common_eq = cur["equity"] - cur["preferred"]
@@ -418,5 +430,6 @@ def explain(row: pd.Series, s: Settings) -> str:
     if lab == "AVOID":
         return (f"Looks cheap (value score {row['value_score']:.2f}) but was removed at "
                 f"'{row['stage']}' - a potential value trap.")
-    note = " Valuation measures are blank because the latest quarterly balance sheet differs sharply from the 10-K (spin-off or merger)." if row.get("major_change", False) else ""
+    note = (" Valuation measures are blank because the company changed substantially after its last 10-K "
+            "(spin-off, divestiture or merger)." if row.get("major_change", False) else "")
     return f"No BUY or SELL signal. Screen outcome: {row['stage']}.{note}"

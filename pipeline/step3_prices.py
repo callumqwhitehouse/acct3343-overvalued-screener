@@ -85,11 +85,24 @@ def main() -> None:
                 continue
             s = splits[t].loc[row["shares_end"] + pd.Timedelta(days=1):f].replace(0, np.nan)
             adj_sh.append(row["shares"] * (s.prod() if s.notna().any() else 1.0))
-        sec_mcap = pd.Series(adj_sh, index=out.index) * unadj_f
+        adj_sh = pd.Series(adj_sh, index=out.index)
+        sec_mcap = adj_sh * unadj_f
         ratio = sec_mcap / fallback
-        ok = sec_mcap.notna() & ratio.between(0.5, 2.0)
+        # The fallback assumes today's share count applied at F. When the SEC count moved a lot
+        # after F (spin-off, reverse split, stock-funded merger), that assumption fails, so the
+        # SEC-based value is kept even if it disagrees with the fallback.
+        sec_now = (lf[lf["snapshot"] == "current"].set_index("cik")["shares"]
+                   .reindex(out["cik"]).set_axis(out.index))
+        share_move = adj_sh * split_factor(splits, f).reindex(out.index).fillna(1.0) / sec_now
+        fallback_suspect = share_move.notna() & ~share_move.between(0.67, 1.5)
+        ok = sec_mcap.notna() & (ratio.between(0.5, 2.0) | fallback_suspect)
         out[f"mcap_{snap}"] = sec_mcap.where(ok, fallback)
         out[f"mcap_src_{snap}"] = np.where(ok, "sec_shares", np.where(fallback.notna(), "price_ratio", None))
+        out[f"share_change_{snap}"] = share_move  # share count at F vs today (split-adjusted)
+        odd = out.index[(np.log(ratio.abs()).abs() > np.log(2)).fillna(False)]
+        if len(odd):
+            print(f"  {snap}: SEC vs price-ratio market cap differ > 2x for {len(odd)} firms: "
+                  + ", ".join(f"{t}({'sec' if ok[t] else 'fallback'})" for t in odd[:40]))
         out[f"ret_{snap}"] = (price_on(adj, e) / price_on(adj, f) - 1).reindex(out.index)
         print(f"{snap}: {int(ok.sum())} firms use SEC share counts, "
               f"{int((~ok & fallback.notna()).sum())} use the price-ratio fallback")

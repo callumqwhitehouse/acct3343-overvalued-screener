@@ -15,9 +15,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from analytics import (ALTMAN_COEFS, LABEL_COLORS, LABEL_ORDER, M_SCORE_CUTOFF, QUALITY_METRICS,
-                       SELL_FLAGS, STANDARD_ALTMAN, VALUE_METRICS, Settings, compute_metrics, explain,
-                       run_screen)
+from analytics import (ALTMAN_COEFS, KNOWN_SEPARATIONS, LABEL_COLORS, LABEL_ORDER, M_SCORE_CUTOFF,
+                       QUALITY_METRICS, SELL_FLAGS, STANDARD_ALTMAN, VALUE_METRICS, Settings,
+                       compute_metrics, explain, run_screen)
 
 st.set_page_config(page_title="Overvalued Stock Screener", page_icon="📉", layout="wide")
 DATA = Path(__file__).parent / "data"
@@ -53,7 +53,8 @@ def metrics_for(snapshot: str, lookback: int, version: tuple) -> pd.DataFrame:
     else:
         mcap = firms.merge(rets, on="ticker").set_index("cik")[f"mcap_{snapshot}"]
     lf = latest[latest["snapshot"] == snapshot].set_index("cik")
-    m = compute_metrics(panels[snapshot], firms, mcap, lookback, latest=lf)
+    m = compute_metrics(panels[snapshot], firms, mcap, lookback, latest=lf,
+                        known_separations=KNOWN_SEPARATIONS if snapshot == "current" else None)
     if snapshot != "current":
         r = rets[["ticker", f"ret_{snapshot}"]].rename(columns={f"ret_{snapshot}": "fwd_ret"})
         m = m.merge(r, on="ticker", how="left")
@@ -473,9 +474,11 @@ def company_tab() -> None:
                 f"Latest 10-K: fiscal year ended {pd.Timestamp(r['fy_end']).date()}")
     st.info(explain(r, settings))
     if r.get("major_change", False):
-        st.warning(f"The latest quarterly balance sheet shows total assets at {r['post_fy_asset_ratio']:.0%} of the "
-                   "10-K figure (likely a spin-off, divestiture or merger), so today's price and the 10-K describe "
-                   "different companies. Price-based ratios are left blank for this firm.")
+        ratio_txt = ("" if pd.isna(r["post_fy_asset_ratio"]) else
+                     f" The latest quarterly balance sheet shows total assets at {r['post_fy_asset_ratio']:.0%} of the 10-K figure.")
+        st.warning("This company changed substantially after its last 10-K (spin-off, divestiture or merger), so "
+                   "today's price and the 10-K describe different businesses." + ratio_txt +
+                   " Price-based ratios are left blank for this firm.")
 
     a, b = st.columns(2)
     with a:
@@ -526,7 +529,7 @@ def company_tab() -> None:
             "Point": [r[c] for c in ("F_ROA", "F_CFO", "F_dROA", "F_ACCRUAL", "F_dLEVER", "F_dLIQUID",
                                      "F_EQ_OFFER", "F_dMARGIN", "F_dTURN")],
         })
-        fsc["Point"] = fsc["Point"].map(lambda v: "–" if pd.isna(v) else int(v))
+        fsc["Point"] = fsc["Point"].map(lambda v: "–" if pd.isna(v) else str(int(v)))
         st.dataframe(fsc, hide_index=True, width="stretch")
         st.markdown(f"F_SCORE = **{fmt(r['fscore'], d=0)}** / 9")
 
@@ -647,9 +650,12 @@ def backtest_tab() -> None:
         "Caveats: the firm list is today's, so companies that went bankrupt, were acquired or shrank below "
         "$1B since formation are missing, and small firms that later boomed are included (survivorship and "
         "look-ahead bias; the formation-date size floor reduces but does not remove it). Formation-date market "
-        "caps use SEC cover-page share counts from the last filing before the formation date. Gross profit "
-        "backfilled from Yahoo uses today's statements, a small look-ahead for those firm-years. Two one-year "
-        "periods is a short sample: treat this as a sanity check, not proof."
+        "caps use the SEC cover-page share count from the last 10-K/10-Q filed before the formation date when "
+        "it is recent and plausible; otherwise "
+        f"({int((rets['mcap_src_bt2025'] == 'price_ratio').sum())} firms for 2025, "
+        f"{int((rets['mcap_src_bt2024'] == 'price_ratio').sum())} for 2024) today's market cap scaled by the "
+        "price change. Gross profit backfilled from Yahoo uses today's statements, a small look-ahead for "
+        "those firm-years. Two one-year periods is a short sample: treat this as a sanity check, not proof."
     )
 
 
@@ -704,12 +710,17 @@ Year-over-year signals require consecutive fiscal years (330-400 days apart).
   only if depreciation is immaterial (< 1% of assets). Otherwise the item is missing rather than zero.
 - Gross profit: SEC data omits cost of sales that firms tag only by product/service dimension (e.g. TMO, GD). For
   those years the app uses Yahoo Finance's standardized gross profit, rescaled to the SEC revenue when Yahoo's
-  revenue differs by more than 3%. Margin trends (ΔMargin, GMI, MG, MS) only compare years from the same source.
+  revenue differs by 3-50% (a larger gap means a different perimeter, and the year stays blank). Margin trends
+  (ΔMargin, GMI, MG, MS) only compare years from the same source.
 - BM and SNOA use common equity (stockholders' equity minus preferred stock).
 - Greenblatt ROC and EBIT/TEV are blank when the denominator is zero or negative, except that positive EBIT on a
   zero/negative TEV ranks as the cheapest. Ch 5 ROC treats zero/negative capital as +100% (profitable) or −99%.
-- If the latest 10-Q shows total assets below 70% or above 150% of the 10-K figure (spin-off, divestiture or
-  merger), price-based ratios are blanked for that firm.
+- If the company changed shape after its last 10-K, price-based ratios are blanked: latest-quarter total assets
+  below 70% of the 10-K figure (spin-off/divestiture), above 150% with more than 15% more shares (stock-funded
+  merger), or above 300%; plus separations announced after the last filing (CTVA, HON, CMCSA, manually reviewed).
+- Firms with an unclassified balance sheet (no current assets/liabilities, e.g. some utilities) have no
+  working capital, so no Altman Z, Greenblatt ROC or current-ratio F_SCORE signal.
+- EBIT is operating income; if not tagged, pre-tax income + interest, else net income + tax + interest.
 - "Within sector" ranking uses percentile ranks inside each Nasdaq sector (sectors with < 3 valid firms rank
   against the universe).
 - Beneish indices that cannot be computed are set to 1 (neutral) and each index is bounded to [0.2, 5].

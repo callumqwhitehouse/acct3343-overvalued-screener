@@ -86,7 +86,9 @@ def main() -> None:
         fill = p["gross_profit"].isna() & m["gross_profit_yf"].notna() & (p["revenue"] > 0)
         implied_rev = m["gross_profit_yf"] + m["cogs_yf"]
         consistent = ((implied_rev / p["revenue"]) - 1).abs() <= 0.03
-        rescale = fill & ~consistent & (implied_rev > 0)
+        # Rescale only small perimeter differences; a large gap means Yahoo's statement covers a
+        # different business (e.g. restated for discontinued operations), so the year stays blank.
+        rescale = fill & ~consistent & (implied_rev > 0) & (p["revenue"] / implied_rev).between(2 / 3, 1.5)
         as_is = fill & (consistent | m["cogs_yf"].isna())
         p.loc[as_is, "gross_profit"] = m.loc[as_is, "gross_profit_yf"]
         p.loc[rescale, "gross_profit"] = (m["gross_profit_yf"] / implied_rev * p["revenue"])[rescale]

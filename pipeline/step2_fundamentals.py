@@ -50,10 +50,10 @@ FIELDS: dict[str, tuple[str, list[str]]] = {
     "interest_exp": ("flow", ["InterestExpense", "InterestExpenseNonoperating", "InterestExpenseDebt",
                               "InterestAndDebtExpense"]),
     "net_income": ("flow", ["NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"]),
+    "income_tax": ("flow", ["IncomeTaxExpenseBenefit"]),
     "ni_cont_ops": ("flow", ["IncomeLossFromContinuingOperations"]),
-    "dep_amort": ("flow", ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization",
-                           "DepreciationAmortizationAndAccretionNet", "Depreciation",
-                           "DepreciationNonproduction"]),
+    "dep_amort": ("flow", ["DepreciationDepletionAndAmortization", "DepreciationAmortizationAndAccretionNet",
+                           "DepreciationAndAmortization", "Depreciation", "DepreciationNonproduction"]),
     "cfo": ("flow", ["NetCashProvidedByUsedInOperatingActivities",
                      "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"]),
     "capex": ("flow", ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets",
@@ -81,18 +81,18 @@ FIELDS: dict[str, tuple[str, list[str]]] = {
     "minority_interest_tag": ("stock", ["MinorityInterest"]),
     "preferred_tag": ("stock", ["PreferredStockValue", "PreferredStockValueOutstanding"]),
     "debt_current_tag": ("stock", ["DebtCurrent"]),
-    "ltd_current": ("stock", ["LongTermDebtAndCapitalLeaseObligationsCurrent", "LongTermDebtCurrent",
+    "ltd_current": ("stock", ["LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent",
                               "LongTermDebtMaturitiesRepaymentsOfPrincipalInNextTwelveMonths"]),
     "st_borrowings": ("stock", ["ShortTermBorrowings", "CommercialPaper", "NotesPayableCurrent",
-                                "ConvertibleNotesPayableCurrent"]),
+                                "ConvertibleNotesPayableCurrent", "ConvertibleDebtCurrent"]),
     "ltd_noncurrent": ("stock", [
         "LongTermDebtAndCapitalLeaseObligations", "LongTermDebtNoncurrent", "LongTermNotesPayable",
         "LongTermNotesAndLoans", "SeniorLongTermNotes", "UnsecuredLongTermDebt", "SecuredLongTermDebt",
         "ConvertibleLongTermNotesPayable", "ConvertibleDebtNoncurrent", "LongTermLineOfCredit",
-        "OtherLongTermDebtNoncurrent"]),
+        "OtherLongTermDebtNoncurrent", "LineOfCredit"]),
     "ltd_total": ("stock", ["LongTermDebt", "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
                             "DebtAndCapitalLeaseObligations", "SeniorNotes", "ConvertibleNotesPayable",
-                            "NotesPayable"]),
+                            "NotesPayable", "ConvertibleDebt", "DebtInstrumentCarryingAmount"]),
     "debt_all": ("stock", ["DebtLongtermAndShorttermCombinedAmount"]),
 }
 TAG_KIND = {t: kind for kind, tags in FIELDS.values() for t in tags}
@@ -103,6 +103,11 @@ MAX_STALENESS_DAYS = 640
 # Registrants that moved to a new CIK (e.g. a new holding company) keep their
 # history under the old one; both files are read.
 CIK_PREDECESSOR = {2115436: 34088}  # Exxon Mobil
+# Debt components: a reported 0 in a higher-priority tag must not hide a positive amount in another.
+FIRST_POSITIVE = {"debt_current_tag", "ltd_current", "st_borrowings", "ltd_noncurrent", "ltd_total", "debt_all"}
+# Alternative tags for one total: the largest reported value is the full amount (a smaller one is a sub-line).
+TAKE_MAX = {"dep_amort", "capex"}
+MAX_SHARE_AGE_DAYS = 400  # older cover-page share counts are usually a single class of a multi-class firm
 
 
 def fact_records(j: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -144,18 +149,26 @@ def fact_records(j: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     return df, ex
 
 
-def latest_filing(ex: pd.DataFrame, asof: pd.Timestamp) -> dict:
-    """Most recent total assets (any 10-Q/10-K) and cover-page shares known on `asof`."""
+def _shares_at(sh: pd.DataFrame, pick: pd.Series) -> float:
+    same = sh[(sh["accn"] == pick["accn"]) & (sh["end"] == pick["end"])]
+    return float(same["val"].sum())  # sum share classes reported in the same filing
+
+
+def latest_filing(ex: pd.DataFrame, asof: pd.Timestamp, fy_end: pd.Timestamp) -> dict:
+    """Most recent total assets (any 10-Q/10-K) and cover-page shares known on `asof`,
+    plus the cover-page share count of the 10-K for `fy_end` (to measure share issuance since)."""
     ex = ex[ex["filed"] <= asof]
-    out = {"q_end": pd.NaT, "q_assets": np.nan, "shares": np.nan, "shares_end": pd.NaT}
+    out = {"q_end": pd.NaT, "q_assets": np.nan, "shares": np.nan, "shares_end": pd.NaT, "shares_10k": np.nan}
     qa = ex[ex["item"] == "q_assets"].sort_values(["end", "filed"])
     if len(qa):
         out["q_end"], out["q_assets"] = qa["end"].iloc[-1], qa["val"].iloc[-1]
-    sh = ex[ex["item"] == "shares"]
+    sh = ex[(ex["item"] == "shares") & (ex["end"] >= asof - pd.Timedelta(days=MAX_SHARE_AGE_DAYS))]
     if len(sh):
         last = sh.sort_values(["filed", "end"]).iloc[-1]
-        same = sh[(sh["accn"] == last["accn"]) & (sh["end"] == last["end"])]
-        out["shares"], out["shares_end"] = same["val"].sum(), last["end"]  # sum share classes
+        out["shares"], out["shares_end"] = _shares_at(sh, last), last["end"]
+        at_10k = sh[sh["end"] >= fy_end].sort_values(["end", "filed"])
+        if len(at_10k):
+            out["shares_10k"] = _shares_at(sh, at_10k.iloc[0])
     return out
 
 
@@ -172,15 +185,24 @@ def build_panel(rec: pd.DataFrame, asof: pd.Timestamp | None, sector: str | None
     out = pd.DataFrame(index=wide.index)
     for field, (_, tags) in FIELDS.items():
         cols = [t for t in tags if t in wide.columns]
+        raw_first = wide[cols].bfill(axis=1).iloc[:, 0] if cols else None
         if not cols:
             out[field] = np.nan
         elif field == "revenue":
-            # A zero or segment-sized 'Revenues' must not hide the full top line.
+            # A zero or segment-sized 'Revenues' must not hide the full top line; a true 0 stays 0.
             vals = wide[cols].where(wide[cols] > 0)
             first, mx = vals.bfill(axis=1).iloc[:, 0], vals.max(axis=1)
-            out[field] = first.where(first >= 0.5 * mx, mx)
+            out[field] = first.where(first >= 0.5 * mx, mx).fillna(raw_first)
+        elif field in FIRST_POSITIVE:
+            out[field] = wide[cols].where(wide[cols] > 0).bfill(axis=1).iloc[:, 0].fillna(raw_first)
+        elif field in TAKE_MAX:
+            out[field] = wide[cols].abs().max(axis=1)
         else:
-            out[field] = wide[cols].bfill(axis=1).iloc[:, 0]
+            out[field] = raw_first
+
+    # Filers whose recent balance sheets lack an Assets tag: total assets = liabilities + total equity.
+    eq_any = out["equity_incl_nci"].fillna(out["equity_tag"])
+    out["total_assets"] = out["total_assets"].fillna(out["liabilities_tag"] + eq_any)
 
     # Fiscal-year ends: a balance sheet and an income/cash-flow statement on the same date.
     flows_present = out[["revenue", "net_income", "cfo", "op_income"]].notna().any(axis=1)
@@ -205,9 +227,10 @@ def derive(p: pd.DataFrame, sector: str | None) -> pd.DataFrame:
     derived_gp = (p["revenue"] - p["cogs"]).where(p["cogs"] >= min_cogs_share * p["revenue"])
     p["gross_profit"] = p["gross_profit_tag"].fillna(derived_gp)
     p["sga"] = p["sga"].fillna(p["ga"] + p["sm"]).fillna(p["ga"])
-    p["ebit"] = p["op_income"].fillna(p["pretax"] + zero(p["interest_exp"]))
-    p["minority_interest"] = zero(p["minority_interest_tag"]).where(
-        p["minority_interest_tag"].notna() | p["equity_tag"].notna())
+    p["ebit"] = (p["op_income"].fillna(p["pretax"] + zero(p["interest_exp"]))
+                 .fillna(p["net_income"] + p["income_tax"] + zero(p["interest_exp"])))
+    # A filer that presents a non-controlling-interest line tags MinorityInterest, so no tag means none.
+    p["minority_interest"] = zero(p["minority_interest_tag"])
     p["preferred"] = zero(p["preferred_tag"])
     p["equity"] = p["equity_tag"].fillna(p["equity_incl_nci"] - p["minority_interest"])
     eq_total = p["equity_incl_nci"].fillna(p["equity"] + p["minority_interest"])
@@ -302,7 +325,7 @@ def main(zip_path: str) -> None:
                 if p is None or p.empty or (a - p.index[-1]).days > MAX_STALENESS_DAYS:
                     continue
                 panels[k].append(p.reset_index(names="fy_end").assign(cik=int(row.cik)))
-                filings.append({"cik": int(row.cik), "snapshot": k, **latest_filing(ex, a)})
+                filings.append({"cik": int(row.cik), "snapshot": k, **latest_filing(ex, a, p.index[-1])})
             kept.append(row._asdict() | {"fy_end": cur.index[-1], "filed": cur["filed"].iloc[-1]})
             if row.sector not in ("Finance", "Real Estate"):
                 n_operating += 1
