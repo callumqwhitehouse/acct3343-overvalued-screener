@@ -21,7 +21,10 @@ from analytics import (ALTMAN_COEFS, KNOWN_SEPARATIONS, LABEL_COLORS, LABEL_ORDE
 
 st.set_page_config(page_title="Overvalued Stock Screener", page_icon="📉", layout="wide")
 DATA = Path(__file__).parent / "data"
-SERIES_1, SERIES_2 = "#2a78d6", "#eb6834"  # categorical slots for non-label charts
+# Chart colours follow the viewer's theme (dark by default; switchable in the app menu).
+IS_DARK = getattr(getattr(st.context, "theme", None), "type", "dark") != "light"
+SERIES_1, SERIES_2, SERIES_3 = ("#3987e5", "#d95926", "#199e70") if IS_DARK else ("#2a78d6", "#eb6834", "#1baf7a")
+MARKER_RING = "rgba(26,26,25,0.8)" if IS_DARK else "rgba(255,255,255,0.6)"
 SNAP_LABEL = {"bt2024": "Formed 2024-10-15", "bt2025": "Formed 2025-10-15"}
 
 
@@ -293,7 +296,7 @@ with tabs[0]:
                     "quality_score": "Quality percentile  (weak → strong)", "label": "Signal"},
             title="Where every firm sits: price vs. quality",
         )
-        fig.update_traces(marker=dict(size=8, opacity=0.8, line=dict(width=1, color="rgba(255,255,255,0.6)")))
+        fig.update_traces(marker=dict(size=8, opacity=0.8, line=dict(width=1, color=MARKER_RING)))
         fig.add_vrect(x0=0, x1=settings.expensive_pct, fillcolor=LABEL_COLORS["SELL"], opacity=0.06, line_width=0)
         fig.add_vrect(x0=1 - settings.value_keep, x1=1, fillcolor=LABEL_COLORS["BUY"], opacity=0.06, line_width=0)
         st.plotly_chart(style_fig(fig, 520), width="stretch")
@@ -541,7 +544,7 @@ def company_tab() -> None:
         long["usd_b"] = long["usd"] / 1e9
         c1, c2 = st.columns(2)
         f1 = px.line(long, x="year", y="usd_b", color="series", markers=True,
-                     color_discrete_sequence=[SERIES_1, SERIES_2, "#1baf7a"],
+                     color_discrete_sequence=[SERIES_1, SERIES_2, SERIES_3],
                      labels={"usd_b": "USD billions", "year": "Fiscal year end", "series": ""},
                      title="Revenue, net income and free cash flow")
         f1.update_traces(line=dict(width=2), marker=dict(size=8))

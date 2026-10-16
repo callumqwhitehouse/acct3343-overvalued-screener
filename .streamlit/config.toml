@@ -1,5 +1,10 @@
 [theme]
-primaryColor = "#2a78d6"
+# Dark by default. Viewers can still switch to Light under the top-right menu > Settings.
+base = "dark"
+primaryColor = "#3987e5"
+backgroundColor = "#1a1a19"
+secondaryBackgroundColor = "#262624"
+textColor = "#f0efec"
 
 [server]
 headless = true
