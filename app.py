@@ -262,6 +262,7 @@ def style_fig(fig: go.Figure, height: int = 420) -> go.Figure:
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
+st.markdown("**Callum Whitehouse** &nbsp;·&nbsp; **ACCT 3343**")
 st.title("Overvalued Stock Screener")
 st.markdown(
     f"Applies the ACCT 3343 financial-statement techniques (magic formula, accruals, Altman Z, franchise "
