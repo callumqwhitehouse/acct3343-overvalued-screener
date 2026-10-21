@@ -16,6 +16,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import importlib
+
+import analytics
+
+# Streamlit Cloud keeps imported modules in memory across code updates; reload so app.py and
+# analytics.py are always the same version.
+importlib.reload(analytics)
 from analytics import (ALTMAN_COEFS, BENEISH, KNOWN_SEPARATIONS, LABEL_COLORS, LABEL_ORDER, M_SCORE_CUTOFF,
                        QUALITY_METRICS, SELL_FLAGS, SELL_PROFITABLE, SELL_SPECULATIVE, STANDARD_ALTMAN,
                        VALUE_METRICS, Settings, compute_metrics, explain, flag_text, pct_rank, run_screen)
