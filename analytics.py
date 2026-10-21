@@ -40,6 +40,8 @@ QUALITY_METRICS = {
     "Greenblatt ROC (Ch 2)": "roc_gb",
 }
 LABEL_ORDER = ["BUY", "SELL", "AVOID", "HOLD"]
+SELL_PROFITABLE = "Overvalued (profitable)"
+SELL_SPECULATIVE = "Speculative (unprofitable)"
 LABEL_COLORS = {"BUY": "#0ca30c", "SELL": "#d03b3b", "AVOID": "#ec835a", "HOLD": "#c3c2b7"}
 
 
@@ -231,8 +233,9 @@ def compute_metrics(panel: pd.DataFrame, firms: pd.DataFrame, mcap: pd.Series,
 
     # ---- Reference values for display ------------------------------------------
     for c in ("revenue", "gross_profit", "ebit", "net_income", "cfo", "fcf", "total_assets", "equity",
-              "preferred", "gp_source"):
+              "preferred", "gp_source", "cash", "ppe_net", "minority_interest"):
         m[c] = cur[c]
+    m["debt"] = debt
     m["gm"] = cur["gm"]
 
     info = firms.set_index("cik")[["ticker", "name", "sector", "industry"]]
@@ -267,7 +270,7 @@ class Settings:
     flag_fscore_max: int = 3
     flag_franchise_pct: float = 0.25
     min_flags: int = 2
-    sell_profitable_only: bool = False
+    sell_scope: str = "both"  # "both", "profitable" or "speculative"
 
 
 SELL_FLAGS = {
@@ -323,11 +326,13 @@ def run_screen(metrics: pd.DataFrame, s: Settings) -> tuple[pd.DataFrame, list[d
     df["mm"] = np.fmax(pct_rank(basis("mg")), pct_rank(basis("ms"))).where(df["mg"].notna() & df["ms"].notna())
     fr_parts = pd.concat([pct_rank(basis(c)) for c in ("roa_geo", "roc_geo", "cfoa")] + [df["mm"]], axis=1)
     # Composites follow the course recipe: rank each measure, add the ranks, re-rank.
-    df["franchise"] = pct_rank(fr_parts.mean(axis=1, skipna=False))
+    df["franchise"] = pct_rank(fr_parts.mean(axis=1).where(fr_parts.notna().sum(axis=1) >= 3))
     value_metrics = s.value_metrics or ["ey"]
     quality_metrics = s.quality_metrics or ["fscore"]
     df["value_score"] = pct_rank(pd.concat([pct_rank(basis(c)) for c in value_metrics], axis=1).mean(axis=1, skipna=False))
-    df["quality_score"] = pct_rank(pd.concat([pct_rank(basis(c)) for c in quality_metrics], axis=1).mean(axis=1, skipna=False))
+    qp = pd.concat([pct_rank(basis(c)) for c in quality_metrics], axis=1)
+    need = max(1, len(quality_metrics) - 1)  # at most one quality measure may be missing
+    df["quality_score"] = pct_rank(qp.mean(axis=1).where(qp.notna().sum(axis=1) >= need))
     # Accrual risk: rank STA and SNOA descending (rank 1 = most accrual-heavy) and add ranks,
     # so a SMALL rank sum is the WORST accrual quality.
     df["accrual_rank_sum"] = basis("sta").rank(ascending=False, method="min") + basis("snoa").rank(ascending=False, method="min")
@@ -387,7 +392,7 @@ def run_screen(metrics: pd.DataFrame, s: Settings) -> tuple[pd.DataFrame, list[d
     if "accruals" in on:
         flags["accruals"] = df["accrual_pct"] <= s.flag_accrual_pct
     if "manipulation" in on:
-        flags["manipulation"] = df["mscore"] > M_SCORE_CUTOFF
+        flags["manipulation"] = (df["mscore"] > M_SCORE_CUTOFF) & ~(df["years_available"] < 3)
     if "distress" in on:
         flags["distress"] = df["altman_z_std"] < s.z_threshold
     if "weak_fscore" in on:
@@ -400,20 +405,48 @@ def run_screen(metrics: pd.DataFrame, s: Settings) -> tuple[pd.DataFrame, list[d
     for c in SELL_FLAGS:
         df[f"flag_{c}"] = flags[c] if c in flags else False
     df["n_flags"] = flags.sum(axis=1) if len(flags.columns) else 0
-    df["expensive"] = df["value_score"] <= s.expensive_pct
-    if s.sell_profitable_only:
-        df["expensive"] &= df["ebit"] > 0
+    # Two SELL groups. Loss-making firms have negative earnings yields and crowd the bottom of
+    # the universe-wide value ranking, so profitable firms are ranked against each other:
+    # "expensive" for them means the most expensive share of firms with positive EBIT.
+    profitable = df["ebit"] > 0
+    df["value_score_profitable"] = np.nan
+    df.loc[profitable, "value_score_profitable"] = pct_rank(df.loc[profitable, "value_score"])
+    expensive_prof = profitable & (df["value_score_profitable"] <= s.expensive_pct)
+    expensive_spec = (~profitable & df["ebit"].notna() & ~(df["roa_geo"] > 0)
+                      & (df["value_score"] <= s.expensive_pct))
+    df["expensive"] = expensive_prof | expensive_spec
+    enough = df["n_flags"] >= s.min_flags
+    sell_prof = expensive_prof & enough & (s.sell_scope in ("both", "profitable"))
+    sell_spec = expensive_spec & enough & (s.sell_scope in ("both", "speculative"))
+    sell = sell_prof | sell_spec
     df["cheap_universe"] = df["value_score"] >= 1 - min(s.value_keep, 0.5)
-    df["overvaluation_score"] = 100 * ((1 - df["value_score"].fillna(0.5)) + (1 - df["quality_score"].fillna(0.5))) / 2
+    v = df["value_score_profitable"].where(profitable, df["value_score"])
+    # Average of expensiveness and weak quality (uses whichever of the two is available).
+    df["overvaluation_score"] = 100 * pd.concat([1 - v, 1 - df["quality_score"]], axis=1).mean(axis=1)
+    df["overvaluation_score_univ"] = 100 * pd.concat([1 - df["value_score"], 1 - df["quality_score"]],
+                                                     axis=1).mean(axis=1)
 
     failed_risk = df.index[df["stage"].str.startswith(("1a", "1b", "2a", "2b")) & df["stage"].str.endswith("excluded")]
-    sell = df["expensive"] & (df["n_flags"] >= s.min_flags)
     df["label"] = "HOLD"
     df.loc[df["cheap_universe"] & df.index.isin(failed_risk), "label"] = "AVOID"
     df.loc[sell, "label"] = "SELL"
     df.loc[df.index.isin(alive) & ~sell, "label"] = "BUY"
     df["label"] = pd.Categorical(df["label"], categories=LABEL_ORDER)
+    df["sell_type"] = np.where(df["label"] == "SELL",
+                               np.where(sell_prof, SELL_PROFITABLE, SELL_SPECULATIVE), None)
     return df.reset_index(drop=True), steps
+
+
+def flag_text(s: Settings) -> dict[str, str]:
+    """Red-flag descriptions with the user's current thresholds filled in."""
+    return {
+        "accruals": f"poor accrual quality (STA + SNOA in the worst {s.flag_accrual_pct:.0%})",
+        "manipulation": f"Beneish M-score above {M_SCORE_CUTOFF}",
+        "distress": f"Altman Z below {s.z_threshold:.2f}",
+        "weak_fscore": f"weak F_SCORE (at most {s.flag_fscore_max})",
+        "weak_franchise": f"weak franchise power (bottom {s.flag_franchise_pct:.0%})",
+        "cash_burn": "negative free cash flow last year",
+    }
 
 
 def explain(row: pd.Series, s: Settings) -> str:
@@ -424,9 +457,16 @@ def explain(row: pd.Series, s: Settings) -> str:
                 f"{s.value_keep:.0%} of survivors and the top {s.quality_keep:.0%} on quality "
                 f"with F_SCORE >= {s.min_fscore}.")
     if lab == "SELL":
-        hit = [SELL_FLAGS[c] for c in SELL_FLAGS if row.get(f"flag_{c}", False)]
-        return (f"Priced in the most expensive {s.expensive_pct:.0%} of the universe (value score "
-                f"{row['value_score']:.2f}) with {int(row['n_flags'])} red flag(s): " + "; ".join(hit) + ".")
+        txt = flag_text(s)
+        hit = [txt[c] for c in SELL_FLAGS if row.get(f"flag_{c}", False)]
+        if row.get("sell_type") == SELL_PROFITABLE:
+            price = (f"Profitable, but priced in the most expensive {s.expensive_pct:.0%} of profitable firms "
+                     f"(cheapness percentile among them {row['value_score_profitable']:.2f})")
+        else:
+            price = (f"Loss-making last year with no record of multi-year profits, yet priced in the most "
+                     f"expensive {s.expensive_pct:.0%} of the universe (value score {row['value_score']:.2f}), "
+                     "so the valuation rests on future profits")
+        return f"{price}, with {int(row['n_flags'])} red flag(s): " + "; ".join(hit) + "."
     if lab == "AVOID":
         return (f"Looks cheap (value score {row['value_score']:.2f}) but was removed at "
                 f"'{row['stage']}' - a potential value trap.")

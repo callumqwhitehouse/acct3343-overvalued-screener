@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -15,9 +16,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from analytics import (ALTMAN_COEFS, KNOWN_SEPARATIONS, LABEL_COLORS, LABEL_ORDER, M_SCORE_CUTOFF,
-                       QUALITY_METRICS, SELL_FLAGS, STANDARD_ALTMAN, VALUE_METRICS, Settings,
-                       compute_metrics, explain, run_screen)
+from analytics import (ALTMAN_COEFS, BENEISH, KNOWN_SEPARATIONS, LABEL_COLORS, LABEL_ORDER, M_SCORE_CUTOFF,
+                       QUALITY_METRICS, SELL_FLAGS, SELL_PROFITABLE, SELL_SPECULATIVE, STANDARD_ALTMAN,
+                       VALUE_METRICS, Settings, compute_metrics, explain, flag_text, pct_rank, run_screen)
 
 st.set_page_config(page_title="Overvalued Stock Screener", page_icon="📉", layout="wide")
 DATA = Path(__file__).parent / "data"
@@ -37,9 +38,43 @@ def data_version() -> tuple:
     return tuple((f.name, f.stat().st_mtime_ns) for f in files)
 
 
+# Nasdaq's sector labels are wrong for a few well-known firms; these are corrected by hand.
+SECTOR_FIX = {"MO": "Consumer Staples", "PM": "Consumer Staples", "PG": "Consumer Staples",
+              "CL": "Consumer Staples", "KVUE": "Consumer Staples", "CHD": "Consumer Staples",
+              "EL": "Consumer Staples", "COTY": "Consumer Staples", "ELF": "Consumer Staples",
+              "EPC": "Consumer Staples", "IPAR": "Consumer Staples", "TMO": "Health Care",
+              "FDXF": "Industrials", "FISV": "Technology"}
+
+
+def clean_names(names: pd.Series) -> pd.Series:
+    """Strip share-class wording from exchange listing names ("... Class A Common Stock")."""
+    n = (names.str.replace(r"\s*\(Name to be changed.*\)\s*$", "", regex=True)
+         .str.replace(r"\s+American Deposit[ao]ry Shares.*$", "", regex=True, case=False)
+         .str.replace(r"\s+Class [A-Z]\b.*(Shares|Units|Interests|Stock).*$", "", regex=True, case=False)
+         .str.replace(r"\s*(Common|Ordinary)\s+(Stock|Shares?)\b.*$", "", regex=True, case=False)
+         .str.replace(r"\s+Subordinate Voting Shares.*$", "", regex=True, case=False)
+         .str.replace(r"\s+(Class [A-Z]\s+)?(Non\s+)?Voting$", "", regex=True, case=False)
+         .str.replace(r"^DBA\s+", "", regex=True)
+         .str.replace(r"\s+REIT$", "", regex=True)
+         .str.replace(r"\s{2,}", " ", regex=True).str.strip()
+         .str.replace(r"^(.+?)\s+\(The\)$", r"The \1", regex=True))
+
+    def dedupe(s: str) -> str:  # "STARWOOD PROPERTY TRUST INC. Starwood Property Trust Inc."
+        w = s.split()
+        h = len(w) // 2
+        if len(w) % 2 == 0 and h and " ".join(w[:h]).lower() == " ".join(w[h:]).lower():
+            return " ".join(w[h:])
+        return s
+
+    return n.map(dedupe)
+
+
 @st.cache_data(show_spinner=False)
 def load_data(version: tuple):
     firms = pd.read_parquet(DATA / "firms.parquet")
+    firms["name"] = clean_names(firms["name"])
+    firms.loc[firms["ticker"] == "TNL", "name"] = "Travel + Leisure Co."
+    firms["sector"] = firms["ticker"].map(SECTOR_FIX).fillna(firms["sector"])
     panels = {k: pd.read_parquet(DATA / f"panel_{k}.parquet") for k in ("current", "bt2025", "bt2024")}
     rets = pd.read_parquet(DATA / "returns.parquet")
     bench = pd.read_parquet(DATA / "benchmark.parquet")
@@ -79,7 +114,8 @@ def pct_slider(label: str, lo: int, hi: int, default: int, key: str, help: str |
 
 with st.sidebar:
     st.header("Screen controls")
-    st.caption("Every chart, table and label updates as you move these.")
+    st.caption("Each section is one step of the course process. Open a section to change its cutoffs; "
+               "every chart, table and recommendation updates as you move them.")
     if st.button("Reset all filters", width="stretch"):
         st.session_state.clear()
         st.rerun()
@@ -97,14 +133,14 @@ with st.sidebar:
                                               "Ranks are used instead of subtracting sector means because a "
                                               "single outlier can move a sector mean a long way.") != "Raw values"
 
-    with st.expander("Step 1 · Manipulation (Ch 3)", expanded=True):
+    with st.expander("Step 1 · Manipulation (Ch 3)", expanded=False):
         accrual_cut = pct_slider("Exclude worst STA + SNOA", 0, 50, 10, "accrual_cut",
                                  "Ranks scaled total accruals and scaled net operating assets (highest = "
                                  "worst), adds the ranks and removes the worst share.")
         use_probm = st.toggle("Also screen on Beneish PROBM", True, key="use_probm")
         probm_cut = pct_slider("Exclude worst PROBM", 0, 30, 5, "probm_cut") if use_probm else 0.0
 
-    with st.expander("Step 2 · Distress (Ch 4)", expanded=True):
+    with st.expander("Step 2 · Distress (Ch 4)", expanded=False):
         altman = st.radio("Altman Z coefficients", list(ALTMAN_COEFS), key="altman",
                           help="Standard Altman (1968) weights work on ratio inputs and are what the "
                                "1.81 / 2.99 zones assume. The slide weights reproduce the class examples "
@@ -118,7 +154,7 @@ with st.sidebar:
                                       step=0.1, format="%.2f", key="z_thr")
         z_hard = st.toggle("Also remove every firm below the cutoff", False, key="z_hard")
 
-    with st.expander("Step 3 · Price (Ch 2)", expanded=True):
+    with st.expander("Step 3 · Price (Ch 2)", expanded=False):
         value_labels = st.multiselect("Value measures (ranked, added, re-ranked)", list(VALUE_METRICS),
                                       ["Earnings yield (EBIT/TEV)", "Book-to-market (BM)"], key="value_m")
         excess = st.radio("Excess cash in TEV", ["Course slides: Cash + CA - CL",
@@ -128,7 +164,7 @@ with st.sidebar:
                                "only subtracts cash not needed to cover current liabilities.")
         value_keep = pct_slider("Keep the cheapest", 5, 100, 30, "value_keep")
 
-    with st.expander("Step 4 · Quality (Ch 2, 5, 6)", expanded=True):
+    with st.expander("Step 4 · Quality (Ch 2, 5, 6)", expanded=False):
         quality_labels = st.multiselect("Quality measures", list(QUALITY_METRICS),
                                         ["Franchise power (Ch 5)", "F_SCORE (Ch 6)", "Gross profitability GPA (Ch 2)"],
                                         key="quality_m")
@@ -138,19 +174,23 @@ with st.sidebar:
         quality_keep = pct_slider("Keep the highest-quality", 5, 100, 50, "quality_keep")
         min_fscore = st.slider("Minimum F_SCORE", 0, 9, 5, key="min_f")
 
-    with st.expander("SELL rules · overvalued", expanded=True):
+    with st.expander("SELL rules · overvalued", expanded=False):
         expensive_pct = pct_slider("'Expensive' = most expensive", 5, 50, 20, "exp_pct",
-                                   "Share of the universe with the lowest value composite.")
+                                   "Profitable firms (EBIT > 0): the most expensive share of profitable firms. "
+                                   "Loss-makers: the most expensive share of the whole universe.")
         flag_labels = st.multiselect("Red flags that count", list(SELL_FLAGS.values()), list(SELL_FLAGS.values()),
                                      key="flags")
         min_flags = st.slider("SELL needs at least this many red flags", 1, 6, 2, key="min_flags")
         if len(flag_labels) < min_flags:
             st.warning(f"Only {len(flag_labels)} red flag(s) are enabled, so no firm can reach {min_flags}: "
                        "the SELL list will be empty.")
-        sell_profitable_only = st.toggle("Only profitable firms (EBIT > 0) can be SELL", False, key="sell_prof",
-                                         help="Off: firms with negative EBIT have a negative earnings yield and rank "
-                                              "as the most expensive. On: SELL focuses on firms that are expensive "
-                                              "relative to real, positive earnings.")
+        sell_scope_label = st.radio(
+            "SELL groups to include", ["Both groups", "Overvalued profitable firms only",
+                                       "Speculative unprofitable firms only"], key="sell_scope",
+            help="Profitable firms (EBIT > 0) count as expensive when they are in the most expensive share of "
+                 "*profitable* firms. Firms with an operating loss last year and no multi-year record of profits "
+                 "have negative earnings yields, so they are compared with the whole universe and form a "
+                 "separate, speculative group.")
         flag_accrual_pct = pct_slider("Accrual flag: worst STA + SNOA", 5, 50, 20, "flag_acc")
         flag_fscore_max = st.slider("F_SCORE flag: score at or below", 0, 6, 3, key="flag_f")
         flag_franchise_pct = pct_slider("Franchise flag: bottom", 5, 50, 25, "flag_fr")
@@ -165,7 +205,8 @@ settings = Settings(
     min_fscore=min_fscore, expensive_pct=expensive_pct,
     sell_flags=[k for k, v in SELL_FLAGS.items() if v in flag_labels], flag_accrual_pct=flag_accrual_pct,
     flag_fscore_max=flag_fscore_max, flag_franchise_pct=flag_franchise_pct, min_flags=min_flags,
-    sell_profitable_only=sell_profitable_only,
+    sell_scope={"Both groups": "both", "Overvalued profitable firms only": "profitable",
+                "Speculative unprofitable firms only": "speculative"}[sell_scope_label],
 )
 
 if not sectors:
@@ -178,6 +219,9 @@ if not value_labels or not quality_labels:
 metrics = metrics_for("current", lookback, VERSION)
 res, steps = run_screen(metrics, settings)
 counts = res["label"].value_counts().reindex(LABEL_ORDER, fill_value=0)
+sells, buys = res[res["label"] == "SELL"], res[res["label"] == "BUY"]
+sells_prof = sells[sells["sell_type"] == SELL_PROFITABLE]
+sells_spec = sells[sells["sell_type"] == SELL_SPECULATIVE]
 
 with st.sidebar:
     st.divider()
@@ -185,7 +229,8 @@ with st.sidebar:
     lines = [f"Universe: **{len(res):,}**"]
     lines += [f"↓ {s['step']}: −{s['missing'] + s['excluded']:,} → {s['remaining']:,}" for s in steps]
     st.markdown("  \n".join(lines))
-    st.markdown(f"**BUY {counts['BUY']} · SELL {counts['SELL']} · AVOID {counts['AVOID']}**")
+    st.markdown(f"**BUY {counts['BUY']} · SELL {counts['SELL']} ({len(sells_prof)} profitable + "
+                f"{len(sells_spec)} speculative) · AVOID {counts['AVOID']}**")
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +240,8 @@ def fmt_money(x: float) -> str:
     if pd.isna(x):
         return "n/a"
     a = abs(x)
+    if a >= 1e12:
+        return f"${x / 1e12:,.2f}T"
     if a >= 1e9:
         return f"${x / 1e9:,.2f}B"
     return f"${x / 1e6:,.1f}M"
@@ -216,10 +263,14 @@ TABLE_COLS = {
                                                    help="Value composite percentile (1 = cheapest)."),
     "quality_score": st.column_config.ProgressColumn("Quality", min_value=0, max_value=1, format="%.2f",
                                                      help="Quality composite percentile (1 = best)."),
-    "overvaluation_score": st.column_config.NumberColumn("Overvaluation score", format="%.0f",
-                                                         help="0-100: average of expensiveness and weak quality."),
+    "overvaluation_score": st.column_config.NumberColumn(
+        "Overvaluation score", format="%.0f",
+        help="0-100: average of (1 - cheapness percentile) and (1 - quality percentile). Cheapness is ranked "
+             "among profitable firms for EBIT > 0 and against the universe for loss-makers, so compare scores "
+             "within a SELL group."),
     "n_flags": st.column_config.NumberColumn("Red flags", format="%d"),
-    "ey": st.column_config.NumberColumn("EBIT/TEV", format="percent"),
+    "ey": st.column_config.NumberColumn("EBIT/TEV", format="percent",
+                                        help="Blank when TEV is zero or negative (ranked as the cheapest case)."),
     "bm": st.column_config.NumberColumn("B/M", format="%.2f"),
     "ep": st.column_config.NumberColumn("E/P", format="percent"),
     "fcfy": st.column_config.NumberColumn("FCF yield", format="percent"),
@@ -243,6 +294,7 @@ for k, v in SELL_FLAGS.items():
 
 
 def show_table(df: pd.DataFrame, cols: list[str], height: int = 520) -> None:
+    df = df.assign(ey=df["ey"].mask(df["ey"] >= 10)) if "ey" in df else df  # hide the TEV<=0 ranking sentinel
     st.dataframe(df[cols], column_config={c: TABLE_COLS.get(c, c) for c in cols}, hide_index=True,
                  width="stretch", height=height)
 
@@ -270,20 +322,379 @@ st.markdown(
     f"10-K filings (fiscal years ending {meta['fy_end_min']} to {meta['fy_end_max']}); market caps are "
     f"from {meta['generated']}. Move any control in the sidebar to re-run the analysis."
 )
+with st.expander("👋 How to use this app (30 seconds)", expanded=True):
+    st.markdown("""
+1. **Start with ⭐ Recommendations**: the top long (BUY) and short (SELL) ideas under the current settings,
+   each with a written, number-backed thesis.
+2. **Change the screen in the sidebar.** Each section is one step of the course process (Ch 2–6); open it to
+   adjust the cutoffs and everything recalculates instantly. *Reset all filters* restores the defaults.
+3. **Check the evidence**: *Step-by-step screen* shows what each test removes, *Company analysis* shows every
+   formula with a firm's real numbers, and *Backtest* applies the same rules to 2024 and 2025 data.
+4. **Signals**: 🟢 BUY = cheap, high-quality survivors · 🔴 SELL = expensive with red flags (profitable or
+   speculative) · 🟠 AVOID = cheap but failed the accounting or distress tests (value trap) · ⚪ HOLD = no signal.
+""")
+with st.expander("📖 Glossary of measures"):
+    st.markdown("""
+| Measure | Chapter | What it tells you | Better when |
+|---|---|---|---|
+| **EBIT/TEV** (earnings yield) | 2 | Operating profit per dollar of enterprise value | Higher = cheaper |
+| **B/M** (book-to-market) | 2 | Book equity per dollar of market value | Higher = cheaper |
+| **GPA** (gross profitability) | 2 | Gross profit / total assets: economic profitability | Higher |
+| **ROC** (Greenblatt) | 2 | EBIT / (net PPE + working capital) | Higher |
+| **STA** (scaled total accruals) | 3 | (Net income − cash from operations) / assets: how much profit is non-cash | Lower |
+| **SNOA** (scaled net operating assets) | 3 | Accumulated operating assets less operating liabilities: a bloated balance sheet | Lower |
+| **M-score / PROBM** (Beneish) | 3 | Probability of earnings manipulation; M > −1.78 is a warning | Lower |
+| **Altman Z** | 4 | Bankruptcy risk: < 1.81 distress, 1.81–2.99 grey, > 2.99 safe | Higher |
+| **CFOA** | 5 | Sum of the look-back years' free cash flow (8 by default) / assets | Higher |
+| **MG / MS** (margin growth / stability) | 5 | Geometric growth and stability (mean ÷ std) of gross margin | Higher |
+| **Franchise power** | 5 | Rank of ROA, ROC, CFOA and the better of MG/MS | Higher |
+| **F_SCORE** (Piotroski) | 6 | 9 pass/fail tests of profitability, leverage/liquidity and efficiency | Higher (0–9) |
+""")
+
 k = st.columns(5)
 k[0].metric("Firms screened", f"{len(res):,}")
 k[1].metric("🟢 BUY candidates", int(counts["BUY"]))
-k[2].metric("🔴 SELL candidates", int(counts["SELL"]))
+k[2].metric("🔴 SELL candidates", int(counts["SELL"]),
+            help=f"{len(sells_prof)} overvalued profitable firms + {len(sells_spec)} speculative loss-makers")
 k[3].metric("🟠 AVOID (value traps)", int(counts["AVOID"]))
 k[4].metric("⚪ HOLD / no signal", int(counts["HOLD"]))
 
-tabs = st.tabs(["Dashboard", "🔴 SELL list", "🟢 BUY list", "Step-by-step screen", "Company analysis",
-                "Backtest", "Methodology"])
+(t_rec, t_dash, t_sell, t_buy, t_steps, t_company, t_backtest, t_method) = st.tabs(
+    ["⭐ Recommendations", "Dashboard", "🔴 SELL list", "🟢 BUY list", "Step-by-step screen",
+     "Company analysis", "Backtest", "Methodology"])
+
+# ---------------------------------------------------------------------------
+# Recommendations
+# ---------------------------------------------------------------------------
+F_NAMES = {"F_ROA": "positive ROA", "F_CFO": "positive cash flow", "F_dROA": "improving ROA",
+           "F_ACCRUAL": "cash flow above net income", "F_dLEVER": "falling leverage",
+           "F_dLIQUID": "improving liquidity", "F_EQ_OFFER": "no net share issuance",
+           "F_dMARGIN": "improving gross margin", "F_dTURN": "improving asset turnover"}
+VAL_NAME = {"ey": "EBIT/TEV", "bm": "book-to-market", "ep": "E/P", "fcfy": "FCF yield"}
+LONG_RANKS = ["Cheapness + quality (average percentile)", "Magic formula (rank EBIT/TEV + rank ROC)",
+              "Quality only", "Cheapness only"]
+SHORT_RANKS = ["Red flags, then overvaluation score", "Overvaluation score", "Beneish M-score (highest first)",
+               "Accrual quality (worst first)"]
+
+
+def top_pct(p: float) -> str:
+    """'top/bottom X%' phrasing that never prints 0%."""
+    return f"{max(1, math.ceil(100 * p))}%"
+
+
+def share_pct(p: float) -> str:
+    """'more than X% of firms' phrasing that never prints 0% or 100%."""
+    return f"{min(99, max(1, math.floor(100 * p)))}%"
+
+
+def share_below(ref: pd.DataFrame, col: str, x: float) -> float:
+    s = ref[col].dropna()
+    return float((s < x).mean()) if pd.notna(x) and len(s) else np.nan
+
+
+def z_zone(z: float) -> str:
+    return "n/a" if pd.isna(z) else "distress" if z < settings.z_threshold else "grey" if z < 2.99 else "safe"
+
+
+def long_score(df: pd.DataFrame, how: str) -> pd.Series:
+    if how.startswith("Magic"):
+        return pct_rank(df["ey"]) + pct_rank(df["roc_gb"])  # Greenblatt: add the two ranks
+    if how == "Quality only":
+        return df["quality_score"]
+    if how == "Cheapness only":
+        return df["value_score"]
+    return (df["value_score"] + df["quality_score"]) / 2
+
+
+def rank_longs(df: pd.DataFrame, how: str, n: int) -> pd.DataFrame:
+    b = df[df["label"] == "BUY"].assign(_s=long_score(df, how))
+    return b.sort_values(["_s", "ticker"], ascending=[False, True], na_position="last").head(n)
+
+
+def rank_shorts(df: pd.DataFrame, how: str, n: int, group: str) -> pd.DataFrame:
+    s = df[df["sell_type"] == group]
+    if how == "Overvaluation score":
+        s = s.sort_values(["overvaluation_score", "ticker"], ascending=[False, True], na_position="last")
+    elif how.startswith("Beneish"):
+        s = s.sort_values(["mscore", "ticker"], ascending=[False, True], na_position="last")
+    elif how.startswith("Accrual"):
+        s = s.sort_values(["accrual_pct", "ticker"], ascending=[True, True], na_position="last")
+    else:
+        s = s.sort_values(["n_flags", "overvaluation_score", "ticker"], ascending=[False, False, True])
+    return s.head(n)
+
+
+def ref_group(r: pd.Series) -> tuple[pd.DataFrame, str]:
+    """Comparison group for a thesis: the firm's sector under 'Within sector' ranking, else the universe."""
+    if settings.relative:
+        return res[res["sector"] == r["sector"]], f"{r['sector']} median"
+    return res, "universe median"
+
+
+def valuation_parts(r: pd.Series, ref: pd.DataFrame, lab: str) -> list[str]:
+    """The measures that actually drive the value composite, each against the comparison median."""
+    fmt_v = lambda c, x: f"{x:.2f}" if c == "bm" else f"{x:.1%}"
+    parts = []
+    for c in settings.value_metrics:
+        x = r.get(c)
+        if pd.isna(x):
+            continue
+        if c == "ey" and x >= 10:
+            parts.append("TEV is zero or negative (cash and working capital exceed market value)")
+            continue
+        parts.append(f"{VAL_NAME[c]} {fmt_v(c, x)} vs a {fmt_v(c, ref[c].median())} {lab}")
+    return parts
+
+
+def thesis(r: pd.Series, side: str) -> list[str]:
+    """Number-backed bullet points for a long or short idea. Every claim is checked against its numbers."""
+    ref, lab = ref_group(r)
+    med = ref[["ey", "gpa", "snoa"]].median()
+    f, z, fr = r["fscore"], r["altman_z_std"], r["franchise"]
+    failed = [F_NAMES[c] for c in F_NAMES if r.get(c) == 0]
+    na = [F_NAMES[c] for c in F_NAMES if pd.isna(r.get(c))]
+    f_note = (f"; rescaled from {int(r['fscore_raw'])}/{int(r['fscore_avail'])}, not computable: {', '.join(na)}"
+              if pd.notna(f) and na else "")
+    vparts = valuation_parts(r, ref, lab)
+    ey = r["ey"]
+    pts: list[str] = []
+    risks: list[str] = []
+    young = pd.notna(r["years_available"]) and r["years_available"] < 3
+    if side == "long":
+        head = "Cheap" if r["value_score"] >= 0.5 else "Valuation"
+        txt = f"**{head}:** cheaper than {share_pct(r['value_score'])} of screened firms on the value composite"
+        if vparts:
+            txt += " (" + "; ".join(vparts) + ")"
+        if pd.notna(ey) and 0 < ey < 10:
+            txt += f", i.e. about {1 / ey:.0f}× operating profit"
+        pts.append(txt + ".")
+        if pd.notna(r["bm"]) and r["bm"] < 0:
+            risks.append("negative common equity")
+        q = []
+        if pd.notna(f):
+            q.append(f"F_SCORE {f:.0f}/9" + (f" (misses: {', '.join(failed)}{f_note})" if failed
+                                              else f" (passes every {'computable ' if na else ''}test{f_note})"))
+        if pd.notna(fr):
+            if fr >= 0.5:
+                q.append(f"franchise power in the top {top_pct(1 - fr)}"
+                         + (f" with a {lookback}-year geometric ROA of {r['roa_geo']:.1%}" if pd.notna(r["roa_geo"]) else ""))
+            else:
+                risks.append(f"franchise power only in the bottom {top_pct(fr)}")
+        if pd.notna(r["gpa"]):
+            if r["gpa"] > med["gpa"]:
+                q.append(f"gross profitability {r['gpa']:.2f} vs a {med['gpa']:.2f} {lab}")
+            else:
+                risks.append(f"gross profitability {r['gpa']:.2f} is below the {med['gpa']:.2f} {lab}")
+        if q:
+            qhead = "High quality" if pd.notna(r["quality_score"]) and r["quality_score"] >= 0.5 else "Quality"
+            pts.append(f"**{qhead}:** " + "; ".join(q) + ".")
+        e = []
+        if pd.notna(r["sta"]):
+            e.append(f"STA {r['sta']:+.1%} (cash flow {'exceeds' if r['sta'] < 0 else 'trails'} net income)")
+        if pd.notna(r["snoa"]):
+            e.append(f"SNOA {r['snoa']:.0%} vs a {med['snoa']:.0%} {lab}")
+        if pd.notna(r["mscore"]):
+            e.append(f"Beneish M-score {r['mscore']:.2f}, below the {M_SCORE_CUTOFF} warning level"
+                     if r["mscore"] <= M_SCORE_CUTOFF else f"Beneish M-score {r['mscore']:.2f}")
+        if e:
+            pts.append("**Earnings quality:** " + "; ".join(e) + ".")
+        zone = z_zone(z)
+        if zone == "safe":
+            pts.append(f"**Financial strength:** Altman Z {z:.2f} (safe zone).")
+        elif zone in ("grey", "distress"):
+            pts.append(f"**Balance sheet:** Altman Z {z:.2f} ({zone} zone).")
+            risks.append(f"Altman Z {z:.2f} is in the {zone} zone")
+        if pd.notna(f) and f <= 6:
+            risks.append(f"F_SCORE is only {f:.0f}")
+        if pd.notna(r["mg"]) and r["mg"] < 1:
+            risks.append(f"gross margins have been slipping (MG {r['mg']:.3f})")
+        if pd.notna(r["sta"]) and r["sta"] > 0:
+            risks.append("net income runs ahead of cash flow")
+        if young:
+            risks.append(f"only {int(r['years_available'])} years of statements")
+        risks.append("cheap stocks can stay cheap, so check the latest quarter for one-off items")
+        pts.append("*Key risks:* " + "; ".join(risks) + ".")
+        return pts
+
+    # ---- short ----
+    if r.get("sell_type") == SELL_PROFITABLE:
+        vsp = r["value_score_profitable"]
+        txt = (f"**Expensive:** in the most expensive {top_pct(vsp)} of profitable firms on the value composite"
+               if pd.notna(vsp) else "**Expensive:** among the most expensive profitable firms")
+        if vparts:
+            txt += " (" + "; ".join(vparts) + ")"
+        if pd.notna(ey) and pd.notna(med["ey"]) and 0 < ey < med["ey"]:
+            txt += f"; about {1 / ey:.0f}× operating profit vs {1 / med['ey']:.0f}× for the median firm"
+        pts.append(txt + ".")
+    else:
+        pts.append(f"**Priced on hope:** an operating loss of {fmt_money(-r['ebit'])} last year and no multi-year "
+                   f"record of profits, yet the market values the company at {fmt_money(r['mcap'])}.")
+    flags = []
+    if r.get("flag_accruals"):
+        parts = []
+        if pd.notna(r["sta"]) and r["sta"] > 0:
+            parts.append(f"net income above cash flow (STA {r['sta']:+.1%})")
+        if pd.notna(r["snoa"]) and share_below(ref, "snoa", r["snoa"]) >= 0.5:
+            parts.append(f"bloated net operating assets (SNOA {r['snoa']:.0%}, above "
+                         f"{share_pct(share_below(ref, 'snoa', r['snoa']))} of firms)")
+        flags.append(f"poor accrual quality, in the worst {settings.flag_accrual_pct:.0%} on STA + SNOA"
+                     + (": " + " and ".join(parts) if parts else
+                        f" (STA {r['sta']:+.1%}, SNOA {r['snoa']:.0%})"))
+    if r.get("flag_manipulation"):
+        flags.append(f"Beneish M-score {r['mscore']:.2f}, above the {M_SCORE_CUTOFF} manipulation threshold")
+    if r.get("flag_distress"):
+        flags.append(f"Altman Z of {z:.2f}, in the distress zone")
+    if r.get("flag_weak_fscore"):
+        flags.append(f"F_SCORE of only {f:.0f}/9")
+    if r.get("flag_weak_franchise"):
+        flags.append(f"franchise power in the bottom {top_pct(fr)}")
+    if r.get("flag_cash_burn"):
+        flags.append(f"burned {fmt_money(-r['fcf'])} of free cash flow last year")
+    pts.append(f"**Red flags ({int(r['n_flags'])}):** " + "; ".join(flags) + ".")
+    if pd.notna(f) and failed:
+        pts.append(f"**F_SCORE {f:.0f}/9** fails on: {', '.join(failed)}{f_note}.")
+    if (pd.notna(fr) and fr >= 0.5) or (pd.notna(r["roa_geo"]) and r["roa_geo"] > 0.10):
+        risks.append("a high-return franchise can justify a premium multiple")
+    if z_zone(z) == "safe":
+        risks.append("no balance-sheet stress (Altman Z in the safe zone)")
+    if young:
+        risks.append(f"only {int(r['years_available'])} fiscal years of statements (recent IPO or spin-off), so "
+                     "accrual signals may reflect carve-out accounting")
+    if r["mcap"] > 1e11:
+        risks.append("a mega-cap with heavy index ownership")
+    if pd.notna(r.get("b_sgi")) and r["b_sgi"] > 1.25:
+        risks.append(f"sales grew {r['b_sgi'] - 1:.0%} last year and may grow into the valuation")
+    if pd.notna(f) and f >= 7:
+        risks.append(f"operating trends are still healthy (F_SCORE {f:.0f})")
+    risks.append("expensive stocks can keep rising and a short's loss is unlimited (see the Backtest tab), so "
+                 "position size matters")
+    pts.append("*Key risks:* " + "; ".join(risks) + ".")
+    return pts
+
+
+def idea_card(r: pd.Series, side: str, rank: int, compact: bool = False) -> None:
+    with st.container(border=True):
+        badge = "🟢 LONG" if side == "long" else "🔴 SHORT"
+        st.markdown(f"**{rank}. {r['ticker']} · {r['name']}**  \n{badge} · {r['sector']} · market cap "
+                    f"{fmt_money(r['mcap'])}")
+        if not compact:
+            c = st.columns(4)
+            c[0].metric("EBIT/TEV", "TEV ≤ 0" if pd.notna(r["ey"]) and r["ey"] >= 10 else fmt(r["ey"], True))
+            c[1].metric("F_SCORE", fmt(r["fscore"], d=0))
+            c[2].metric("Altman Z", fmt(r["altman_z_std"]))
+            c[3].metric("Red flags" if side == "short" else "Quality pct",
+                        int(r["n_flags"]) if side == "short" else fmt(r["quality_score"]))
+        st.markdown("\n".join(f"- {x}" for x in thesis(r, side)))
+
+
+_BT_CACHE: dict = {}
+
+
+def backtest_frames(floor_b: float) -> dict[str, pd.DataFrame]:
+    """Screen results on the two point-in-time snapshots under the current settings (memoised per run)."""
+    if floor_b not in _BT_CACHE:
+        out = {}
+        for snap in ("bt2024", "bt2025"):
+            bm_ = metrics_for(snap, lookback, VERSION)
+            out[snap], _ = run_screen(bm_, dataclasses.replace(settings, min_mcap=max(floor_b * 1e9, settings.min_mcap)))
+        _BT_CACHE[floor_b] = out
+    return _BT_CACHE[floor_b]
+
+
+def rule_results(frames: dict[str, pd.DataFrame], rank: dict) -> list[dict]:
+    """Backtest of the exact recommendation rule: picks are made before looking at returns."""
+    rows = []
+    for snap, full in frames.items():
+        L = rank_longs(full, rank["long"], rank["n"])
+        S = rank_shorts(full, rank["short"], rank["n"], SELL_PROFITABLE)
+        lr, sr = full.loc[L.index, "fwd_ret"], full.loc[S.index, "fwd_ret"]
+        rows.append({
+            "Formation": SNAP_LABEL[snap], "Longs": len(L), "Shorts": len(S),
+            "Avg long return": lr.mean(), "Avg return of shorted stocks": sr.mean(),
+            "Long minus short": lr.mean() - sr.mean() if len(L) and len(S) else np.nan,
+            "Long picks": ", ".join(f"{tk} {v:+.0%}" if pd.notna(v) else f"{tk} n/a" for tk, v in zip(L["ticker"], lr)),
+            "Short picks": ", ".join(f"{tk} {v:+.0%}" if pd.notna(v) else f"{tk} n/a" for tk, v in zip(S["ticker"], sr)),
+        })
+    return rows
+
+
+def recommendations_tab() -> dict:
+    st.subheader("Recommendations")
+    rc = st.columns([3, 3, 2])
+    how_long = rc[0].selectbox("Rank long ideas by", LONG_RANKS, key="rank_long")
+    how_short = rc[1].selectbox("Rank short ideas by", SHORT_RANKS, key="rank_short")
+    n = int(rc[2].number_input("Ideas per side", min_value=3, max_value=10, value=5, step=1, key="n_ideas"))
+    rank = {"long": how_long, "short": how_short, "n": n}
+    st.markdown(
+        f"Under the current sidebar settings the screen recommends going **long** the top {n} BUY candidates "
+        f"(ranked by *{how_long.lower()}*) and **short** the top {n} overvalued profitable SELL candidates "
+        f"(ranked by *{how_short.lower()}*). Every number below is from the firm's latest 10-K and today's market "
+        f"value, compared with the {len(res):,} screened firms"
+        + (" in the same sector" if settings.relative else "") + ". Change any setting and this page re-ranks."
+    )
+    rr = rule_results(backtest_frames(st.session_state.get("bt_floor", 2)), rank)
+    if rr:
+        bits = [f"{x['Formation'].lower()}: longs {x['Avg long return']:+.1%}, shorted stocks "
+                f"{x['Avg return of shorted stocks']:+.1%}" for x in rr
+                if pd.notna(x["Avg long return"]) and pd.notna(x["Avg return of shorted stocks"])]
+        if bits:
+            st.caption("Backtest of this exact rule over the next 12 months (a short gains when its stock falls): "
+                       + "; ".join(bits) + ". Details on the Backtest tab.")
+
+    longs = rank_longs(res, how_long, n)
+    shorts = rank_shorts(res, how_short, n, SELL_PROFITABLE)
+    spec = rank_shorts(res, how_short, 3, SELL_SPECULATIVE)
+    baskets = {"Long ideas": longs, "Short ideas (profitable)": shorts, "Speculative shorts": spec, "Universe": res}
+    cols = {"ey": "EBIT/TEV", "bm": "B/M", "gpa": "GPA", "fscore": "F_SCORE", "altman_z_std": "Altman Z",
+            "sta": "STA", "snoa": "SNOA", "franchise": "Franchise pct"}
+    summ = pd.DataFrame({k: v.assign(ey=v["ey"].mask(v["ey"] >= 10))[list(cols)].median()
+                         for k, v in baskets.items() if len(v)}).T.rename(columns=cols)
+    st.markdown("**Median profile of each basket**")
+    st.dataframe(summ.style.format({"EBIT/TEV": "{:.1%}", "STA": "{:+.1%}", "SNOA": "{:.0%}", "B/M": "{:.2f}",
+                                    "GPA": "{:.2f}", "F_SCORE": "{:.0f}", "Altman Z": "{:.2f}",
+                                    "Franchise pct": "{:.2f}"}, na_rep="–"), width="stretch")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown(f"### 🟢 Top {len(longs)} long idea{'s' if len(longs) > 1 else ''}" if len(longs)
+                    else "### 🟢 Long ideas")
+        if longs.empty:
+            st.info("No BUY candidates under the current settings. Loosen Step 3 or Step 4 in the sidebar.")
+        for i, (_, r) in enumerate(longs.iterrows(), 1):
+            idea_card(r, "long", i)
+    with right:
+        st.markdown(f"### 🔴 Top {len(shorts)} short idea{'s' if len(shorts) > 1 else ''}: overvalued profitable firms"
+                    if len(shorts)
+                    else "### 🔴 Short ideas: overvalued profitable firms")
+        if shorts.empty:
+            st.info('Profitable shorts are hidden by the "SELL groups to include" setting in the sidebar.'
+                    if settings.sell_scope == "speculative" else
+                    "No profitable SELL candidates under the current settings. Lower the red-flag requirement or "
+                    "widen the 'expensive' share under SELL rules.")
+        for i, (_, r) in enumerate(shorts.iterrows(), 1):
+            idea_card(r, "short", i)
+    if len(spec):
+        st.markdown(f"### 🔴 Speculative shorts: {len(spec)} loss-making firm{'s' if len(spec) > 1 else ''} "
+                    "priced on hope")
+        st.caption("Higher risk: these can rise sharply on news, so they suit only small positions.")
+        sc = st.columns(len(spec))
+        for i, (_, r) in enumerate(spec.iterrows(), 1):
+            with sc[i - 1]:
+                idea_card(r, "short", i, compact=True)
+    elif settings.sell_scope == "profitable":
+        st.caption('Speculative shorts are hidden by the "SELL groups to include" setting in the sidebar.')
+    st.caption("These are screening outputs from public financial statements, produced for an ACCT 3343 course "
+               "project. They are not investment advice.")
+    return rank
+
+
+with t_rec:
+    RANK = recommendations_tab()
 
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
-with tabs[0]:
+with t_dash:
     c1, c2 = st.columns([3, 2])
     with c1:
         plot = res.dropna(subset=["value_score", "quality_score"])
@@ -301,9 +712,11 @@ with tabs[0]:
         fig.add_vrect(x0=0, x1=settings.expensive_pct, fillcolor=LABEL_COLORS["SELL"], opacity=0.06, line_width=0)
         fig.add_vrect(x0=1 - settings.value_keep, x1=1, fillcolor=LABEL_COLORS["BUY"], opacity=0.06, line_width=0)
         st.plotly_chart(style_fig(fig, 520), width="stretch")
-        st.caption("Shaded left band: the 'expensive' zone where SELL candidates come from. Shaded right band: "
-                   "the cheap zone BUY candidates are drawn from (after the accrual and distress screens). "
-                   "Orange AVOID points look cheap but failed the manipulation or distress screens.")
+        st.caption("Shaded left band: the most expensive firms in the whole universe, where speculative SELL "
+                   "candidates come from. Red points to the right of it are profitable firms that are expensive "
+                   "relative to other profitable firms. Shaded right band: the cheap zone BUY candidates are drawn "
+                   "from (after the accrual and distress screens). Orange AVOID points look cheap but failed the "
+                   "manipulation or distress screens.")
     with c2:
         fun = pd.DataFrame([{"stage": "Universe", "n": len(res)}] +
                            [{"stage": s["step"], "n": s["remaining"]} for s in steps])
@@ -316,37 +729,47 @@ with tabs[0]:
     prof_cols = {"ey": "EBIT/TEV", "bm": "B/M", "gpa": "GPA", "fscore": "F_SCORE", "altman_z": "Altman Z",
                  "sta": "STA", "snoa": "SNOA", "mscore": "M-score", "cfoa": "CFOA (8y FCF / TA)",
                  "roa_geo": "Geo-avg ROA", "mg": "Margin growth", "ms": "Margin stability"}
-    prof = res.groupby("label", observed=False)[list(prof_cols)].median().T
-    prof["Universe"] = res[list(prof_cols)].median()
+    grp = res["sell_type"].fillna(res["label"].astype(str)).replace(
+        {SELL_PROFITABLE: "SELL · profitable", SELL_SPECULATIVE: "SELL · speculative"})
+    prof = res.assign(ey=res["ey"].mask(res["ey"] >= 10)).groupby(grp)[list(prof_cols)].median().T
+    prof["Universe"] = res.assign(ey=res["ey"].mask(res["ey"] >= 10))[list(prof_cols)].median()
     prof.index = [prof_cols[i] for i in prof.index]
-    prof = prof[[c for c in LABEL_ORDER + ["Universe"] if c in prof.columns]]
-    st.dataframe(prof.style.format("{:.3f}", na_rep="–"), width="stretch")
+    order = ["BUY", "SELL · profitable", "SELL · speculative", "AVOID", "HOLD", "Universe"]
+    prof = prof[[c for c in order if c in prof.columns]]
+    pct_rows = [r for r in ("EBIT/TEV", "STA", "SNOA", "Geo-avg ROA") if r in prof.index]
+    sty = (prof.style.format("{:.2f}", na_rep="–")
+           .format("{:.1%}", na_rep="–", subset=pd.IndexSlice[pct_rows, :])
+           .format("{:.0f}", na_rep="–", subset=pd.IndexSlice[["F_SCORE"], :]))
+    st.dataframe(sty, width="stretch")
 
-    sells, buys = res[res["label"] == "SELL"], res[res["label"] == "BUY"]
-    if len(sells) and len(buys):
-        loss_share = (sells["ebit"] <= 0).mean()
-        price_line = (
-            f"**{loss_share:.0%}** of them have zero or negative operating profit, so their market value rests on "
-            "expectations rather than current earnings"
-            if loss_share >= 0.5 else
-            "investors pay far more per dollar of operating profit than for the typical firm"
-        )
-        st.markdown(
-            f"""
-**Reading the result (updates with the filters):**
-- **SELL candidates ({len(sells)})** have a median earnings yield (EBIT/TEV) of **{sells['ey'].median():.1%}** vs.
-  **{res['ey'].median():.1%}** for the universe; {price_line}.
-  Their median F_SCORE is **{sells['fscore'].median():.0f}**, median Altman Z is **{sells['altman_z'].median():.2f}**,
-  and **{(sells['fcf'] < 0).mean():.0%}** burned free cash flow last year. A high price combined with weak or
-  deteriorating fundamentals is the profile of a potentially overvalued stock. (Turn on *Only profitable firms*
-  under SELL rules to focus on firms that are expensive relative to positive earnings.)
-- **BUY candidates ({len(buys)})** have a median earnings yield of **{buys['ey'].median():.1%}**, median F_SCORE
-  **{buys['fscore'].median():.0f}**, and median franchise percentile **{buys['franchise'].median():.2f}** —
-  cheap, financially sound and not dependent on accruals.
-- **{counts['AVOID']} firms look cheap but failed the accrual or distress screens**. These are the value traps
-  the Quantitative Value process is designed to remove before buying.
-"""
-        )
+    if len(sells) or len(buys):
+        med_ey = res["ey"].median()
+        bullets = []
+        if len(sells_prof):
+            ey_p = sells_prof["ey"].median()
+            mult = f" (about {1 / ey_p:.0f}× operating profit vs {1 / med_ey:.0f}× for the median firm)" if ey_p > 0 and med_ey > 0 else ""
+            bullets.append(
+                f"- **{len(sells_prof)} overvalued profitable firms** have a median EBIT/TEV of **{ey_p:.1%}** vs "
+                f"**{med_ey:.1%}** for the universe{mult}, together with red flags such as accrual-heavy earnings "
+                f"({sells_prof['flag_accruals'].mean():.0%} of them), a high Beneish M-score "
+                f"({sells_prof['flag_manipulation'].mean():.0%}) or negative free cash flow "
+                f"({sells_prof['flag_cash_burn'].mean():.0%}). A high price on weakening fundamentals is the "
+                "classic overvaluation profile.")
+        if len(sells_spec):
+            bullets.append(
+                f"- **{len(sells_spec)} speculative SELL candidates** made an operating loss last year yet have a "
+                f"median market cap of **{fmt_money(sells_spec['mcap'].median())}**: their value rests on expected "
+                f"future profits. {(sells_spec['fcf'] < 0).mean():.0%} burned free cash flow and their median "
+                f"F_SCORE is {sells_spec['fscore'].median():.0f}.")
+        if len(buys):
+            bullets.append(
+                f"- **{len(buys)} BUY candidates** have a median EBIT/TEV of **{buys['ey'].median():.1%}**, median "
+                f"F_SCORE **{buys['fscore'].median():.0f}**, and median franchise percentile "
+                f"**{buys['franchise'].median():.2f}**: cheap, financially sound and not dependent on accruals.")
+        bullets.append(
+            f"- **{counts['AVOID']} firms look cheap but failed the accrual or distress screens**. These are the "
+            "value traps the Quantitative Value process is designed to remove before buying.")
+        st.markdown("**Reading the result (updates with the filters):**\n" + "\n".join(bullets))
 
     sec = (res.groupby(["sector", "label"], observed=False).size().unstack(fill_value=0)
            .reindex(columns=LABEL_ORDER, fill_value=0))
@@ -364,20 +787,37 @@ with tabs[0]:
 # ---------------------------------------------------------------------------
 # SELL list
 # ---------------------------------------------------------------------------
-with tabs[1]:
+SELL_COLS = ["ticker", "name", "sector", "mcap", "n_flags", "overvaluation_score", "value_score",
+             "quality_score", "ey", "bm", "fscore", "altman_z", "sta", "snoa", "mscore", "franchise"]
+with t_sell:
     st.subheader(f"🔴 SELL candidates: {len(sells)} potentially overvalued stocks")
     st.markdown(
-        f"A firm is a **SELL** candidate when it is in the **most expensive {settings.expensive_pct:.0%}** of the "
-        f"universe on the value composite **and** shows at least **{settings.min_flags}** of the red flags "
-        "selected in the sidebar. Sorted by number of red flags, then by overvaluation score."
+        f"A SELL candidate needs at least **{settings.min_flags}** of the red flags selected in the sidebar and a "
+        "price that is hard to justify. The list has two groups, because loss-making firms always look "
+        "expensive on earnings and would otherwise crowd out everything else:\n"
+        f"- **Overvalued (profitable)**: positive EBIT, but in the most expensive {settings.expensive_pct:.0%} of "
+        "*profitable* firms. These are the more conventional short ideas.\n"
+        f"- **Speculative (unprofitable)**: an operating loss last year, no multi-year record of profits, and in "
+        f"the most expensive {settings.expensive_pct:.0%} "
+        "of the universe. The price rests on future profits that may not arrive.\n\n"
+        "Each group is sorted by number of red flags, then by overvaluation score."
     )
-    sl = sells.sort_values(["n_flags", "overvaluation_score"], ascending=False).copy()
-    sl["why"] = [explain(r, settings) for _, r in sl.iterrows()]
-    show_table(sl, ["ticker", "name", "sector", "mcap", "n_flags", "overvaluation_score", "value_score",
-                    "quality_score", "ey", "bm", "fscore", "altman_z", "sta", "snoa", "mscore", "franchise"]
-               + [f"flag_{k}" for k in SELL_FLAGS] + ["why"])
-    csv_button(sl, "sell_candidates", "dl_sell")
-    near = (res[res["expensive"] & (res["n_flags"] == settings.min_flags - 1) & (res["label"] != "SELL")]
+    for group, frame in ((SELL_PROFITABLE, sells_prof), (SELL_SPECULATIVE, sells_spec)):
+        st.markdown(f"#### {group}: {len(frame)}")
+        if frame.empty:
+            hidden = ((group == SELL_PROFITABLE and settings.sell_scope == "speculative")
+                      or (group == SELL_SPECULATIVE and settings.sell_scope == "profitable"))
+            st.info('This group is hidden by the "SELL groups to include" setting in the sidebar.' if hidden
+                    else "No firms in this group under the current settings.")
+            continue
+        sl = frame.sort_values(["n_flags", "overvaluation_score"], ascending=False).copy()
+        sl["why"] = [explain(r, settings) for _, r in sl.iterrows()]
+        show_table(sl, SELL_COLS + [f"flag_{k}" for k in SELL_FLAGS] + ["why"], height=min(80 + 35 * len(sl), 460))
+    csv_button(sells.sort_values(["sell_type", "n_flags", "overvaluation_score"], ascending=[True, False, False]),
+               "sell_candidates", "dl_sell")
+    in_scope = {"both": pd.Series(True, index=res.index), "profitable": res["ebit"] > 0,
+                "speculative": ~(res["ebit"] > 0)}[settings.sell_scope]
+    near = (res[res["expensive"] & in_scope & (res["n_flags"] == settings.min_flags - 1) & (res["label"] != "SELL")]
             if settings.sell_flags and settings.min_flags <= len(settings.sell_flags) else res.iloc[0:0])
     with st.expander(f"Watch list: {len(near)} expensive firms one red flag short of SELL"):
         show_table(near.sort_values("overvaluation_score", ascending=False),
@@ -387,7 +827,7 @@ with tabs[1]:
 # ---------------------------------------------------------------------------
 # BUY list
 # ---------------------------------------------------------------------------
-with tabs[2]:
+with t_buy:
     st.subheader(f"🟢 BUY candidates: {len(buys)} firms that survive every screen")
     st.markdown(
         "Survivors of the sequential Quantitative Value process: no extreme accruals (Ch 3), no distress "
@@ -418,11 +858,13 @@ STEP_HELP = {
     "value_score": "Rank each selected value measure, average the ranks and re-rank (1 = cheapest).",
     "quality_score": "Rank each selected quality measure, average and re-rank (1 = best). Then apply the minimum F_SCORE.",
 }
-with tabs[3]:
+AXIS = {"mscore": "Beneish M-score", "altman_z": "Altman Z", "z_rel_step": "Altman Z percentile within sector",
+        "value_score": "Cheapness percentile", "quality_score": "Quality percentile"}
+with t_steps:
     st.markdown("Each screen acts only on the firms that survive the preceding screen. Firms missing a required "
                 "metric are removed at that step and counted separately from the percentile cutoff.")
-    st.dataframe(pd.DataFrame(steps)[["step", "chapter", "entering", "missing", "excluded", "remaining"]],
-                 hide_index=True, width="stretch")
+    st.dataframe(pd.DataFrame(steps)[["step", "chapter", "entering", "missing", "excluded", "remaining"]]
+                 .rename(columns=str.title), hide_index=True, width="stretch")
     for s_ in steps:
         st.markdown(f"#### {s_['step']}  ·  {s_['chapter']}")
         m1, m2, m3, m4 = st.columns(4)
@@ -447,7 +889,7 @@ with tabs[3]:
             lo, hi = d[col].quantile([0.01, 0.99])
             d[col] = d[col].clip(lo, hi)
             hfig = px.histogram(d, x=col, color="outcome", color_discrete_map=cmap, nbins=60,
-                                barmode="overlay", labels={col: col.replace("_", " "), "outcome": ""},
+                                barmode="overlay", labels={col: AXIS.get(col, col), "outcome": ""},
                                 category_orders={"outcome": ["Retained", "Excluded"]})
             hfig.update_traces(opacity=0.8)
         st.plotly_chart(style_fig(hfig, 300), width="stretch", key=f"step_{s_['step']}")
@@ -468,7 +910,10 @@ def company_tab() -> None:
     tick_opts = options["ticker"].tolist()
     label_of = {t: f"{t} — {n}  [{lab}]" for t, n, lab in zip(options["ticker"], options["name"], options["label"])}
     if st.session_state.get("company") not in tick_opts:
-        st.session_state["company"] = sells["ticker"].iloc[0] if len(sells) else tick_opts[0]
+        first = rank_shorts(res, RANK["short"], 1, SELL_PROFITABLE)
+        if first.empty:
+            first = rank_longs(res, RANK["long"], 1)
+        st.session_state["company"] = first["ticker"].iloc[0] if len(first) else tick_opts[0]
     pick = st.selectbox("Choose a company", tick_opts, format_func=label_of.get, key="company")
     r = res.set_index("ticker").loc[pick]
     hist = panels["current"][panels["current"]["cik"] == r["cik"]].sort_values("fy_end")
@@ -484,14 +929,21 @@ def company_tab() -> None:
                    "today's price and the 10-K describe different businesses." + ratio_txt +
                    " Price-based ratios are left blank for this firm.")
 
+    excess_cash = r[f"excess_cash_{settings.excess_cash}"]
+    excess_cash = r["cash"] if pd.isna(excess_cash) else excess_cash
+    ey_txt = "n/a (TEV ≤ 0, ranked cheapest)" if pd.notna(r["ey"]) and r["ey"] >= 10 else fmt(r["ey"], True)
     a, b = st.columns(2)
     with a:
         st.markdown("**Ch 2 · Price and quality**")
         st.markdown(
             f"- GPA = (Revenue − COGS) / TA = {fmt_money(r['gross_profit'])} / {fmt_money(r['total_assets'])} = **{fmt(r['gpa'])}**\n"
             f"- BM = Common book equity / Market cap = {fmt_money(r['common_equity'])} / {fmt_money(r['mcap'])} = **{fmt(r['bm'])}**\n"
-            f"- Earnings yield = EBIT / TEV = {fmt_money(r['ebit'])} / {fmt_money(r['tev'])} = **{fmt(r['ey'], True)}**\n"
-            f"- Greenblatt ROC = EBIT / (Net PPE + NWC) = **{fmt(r['roc_gb'], True)}**\n"
+            f"- TEV = Market cap + Debt − Excess cash + Preferred + Minority interest = {fmt_money(r['mcap'])} + "
+            f"{fmt_money(r['debt'])} − {fmt_money(excess_cash)} + {fmt_money(r['preferred'])} + "
+            f"{fmt_money(r['minority_interest'])} = **{fmt_money(r['tev'])}**\n"
+            f"- Earnings yield = EBIT / TEV = {fmt_money(r['ebit'])} / {fmt_money(r['tev'])} = **{ey_txt}**\n"
+            f"- Greenblatt ROC = EBIT / (Net PPE + NWC) = {fmt_money(r['ebit'])} / ({fmt_money(r['ppe_net'])} + "
+            f"{fmt_money(r['nwc'])}) = **{fmt(r['roc_gb'], True)}**\n"
             f"- Cheapness percentile **{fmt(r['value_score'])}**, quality percentile **{fmt(r['quality_score'])}**"
         )
         st.markdown("**Ch 3 · Accruals and manipulation**")
@@ -502,6 +954,16 @@ def company_tab() -> None:
             f"{fmt_money(r['total_assets'])} = **{fmt(r['snoa'], True)}**\n"
             f"- Beneish M-score = **{fmt(r['mscore'])}** (PROBM {fmt(r['probm'], True)}; flag if M > {M_SCORE_CUTOFF})"
         )
+        bn = pd.DataFrame({
+            "Index": ["DSRI receivables/sales", "GMI gross-margin decline", "AQI asset quality", "SGI sales growth",
+                      "DEPI depreciation rate", "SGAI SG&A/sales", "LVGI leverage", "TATA total accruals/assets"],
+            "Value": [r[f"b_{c}"] for c in ("dsri", "gmi", "aqi", "sgi", "depi", "sgai", "lvgi", "tata")],
+            "Coefficient": [BENEISH[c] for c in ("dsri", "gmi", "aqi", "sgi", "depi", "sgai", "lvgi", "tata")],
+        })
+        bn["Contribution"] = bn["Value"] * bn["Coefficient"]
+        with st.expander(f"Beneish M-score build-up: {BENEISH['const']} + Σ contributions"):
+            st.dataframe(bn.style.format({"Value": "{:.3f}", "Coefficient": "{:+.3f}", "Contribution": "{:+.3f}"},
+                                         na_rep="–"), hide_index=True, width="stretch")
         st.markdown("**Ch 4 · Altman Z**")
         coefs = ALTMAN_COEFS[settings.altman]
         az = pd.DataFrame({
@@ -519,9 +981,13 @@ def company_tab() -> None:
         st.markdown(f"Standard Z = **{fmt(zstd)}** → {zone} zone{extra}")
     with b:
         st.markdown(f"**Ch 5 · Franchise power ({lookback}-year window)**")
+        n_fcf = int(hist["fcf"].tail(lookback).isna().sum())
+        cfoa_note = (f" (FCF missing for {n_fcf} of the last {lookback} years)" if pd.isna(r["cfoa"]) and n_fcf
+                     else f" (only {len(hist)} years of statements)" if pd.isna(r["cfoa"]) and len(hist) < lookback
+                     else "")
         st.markdown(
             f"- Geometric-average ROA **{fmt(r['roa_geo'], True)}**, geometric-average ROC **{fmt(r['roc_geo'], True)}**\n"
-            f"- CFOA = Σ FCF / TA = **{fmt(r['cfoa'])}**\n"
+            f"- CFOA = Σ FCF / TA = **{fmt(r['cfoa'])}**{cfoa_note}\n"
             f"- Margin growth MG = [Π GMₜ₊₁/GMₜ]^(1/T) = **{fmt(r['mg'], d=3)}**\n"
             f"- Margin stability MS = mean(GM) / std(GM) = **{fmt(r['ms'], d=1)}**\n"
             f"- Franchise percentile **{fmt(r['franchise'])}** (years of data: {int(r['years_available'])})"
@@ -561,17 +1027,90 @@ def company_tab() -> None:
             raw.index = raw.index.strftime("%Y-%m-%d")
             st.dataframe(raw.select_dtypes("number").T, width="stretch")
             src = raw["gp_source"].fillna("n/a") if "gp_source" in raw else pd.Series("sec", index=raw.index)
-            st.caption("10-K filed: " + ", ".join(raw["filed"].dt.strftime("%Y-%m-%d")) +
+            st.caption("Latest filing reporting each year (restated values replace originals): "
+                       + ", ".join(f"FY{fy}: {d}" for fy, d in zip(raw.index.str[:7], raw["filed"].dt.strftime("%Y-%m-%d"))) +
                        ". Gross profit source by year: " + ", ".join(src) +
                        " (yahoo = Yahoo Finance standardized statement, used where SEC data has no gross profit).")
 
 
-with tabs[4]:
+with t_company:
     company_tab()
 
 # ---------------------------------------------------------------------------
 # Backtest
 # ---------------------------------------------------------------------------
+def interpret_backtest(notes: list[dict]) -> None:
+    """Plain-English reading of the backtest. Every sentence is conditional on the numbers shown."""
+    if not notes:
+        return
+    pct = lambda x: "n/a" if pd.isna(x) else f"{(0.0 if abs(x) < 0.0005 else x):+.1%}"
+    lines = []
+    for n in notes:
+        if pd.isna(n["buy"]):
+            buy = "no BUY candidates"
+        else:
+            med_win, avg_win = n["buy"] > n["uni"], n["buy_avg"] > n["uni_avg"]
+            verdict = ("beat on both median and average" if med_win and avg_win else
+                       "lagged on both median and average" if not med_win and not avg_win else
+                       "beat on median, lagged on average" if med_win else "lagged on median, beat on average")
+            buy = f"BUY median {pct(n['buy'])} vs {pct(n['uni'])} for the median firm ({verdict})"
+        parts = [buy]
+        if pd.notna(n["prof"]):
+            parts.append(f"profitable SELLs median {pct(n['prof'])}")
+        if pd.notna(n["spec"]):
+            parts.append(f"speculative SELLs median {pct(n['spec'])}")
+        if pd.notna(n["q5"]) and pd.notna(n["q1"]):
+            parts.append(f"cheapest fifth {pct(n['q5'])} vs most expensive fifth {pct(n['q1'])} (average)")
+        lines.append(f"- **{n['label']}** (S&P 500 {pct(n['spy'])}): " + "; ".join(parts) + ".")
+    st.markdown("#### How to read these results\n" + "\n".join(lines))
+
+    para = []
+    years = "both test years" if len(notes) == 2 else "the test year"
+    sold_up = [n for n in notes if pd.notna(n["sell_avg"]) and n["sell_avg"] > max(n["uni_avg"], 0)
+               and pd.notna(n["sell_med"]) and n["sell_med"] > n["uni"]]
+    if len(sold_up) == len(notes):
+        txt = (f"In {years} (S&P 500 " + " and ".join(pct(n["spy"]) for n in notes) + ") the SELL candidates rose "
+               "more than the average stock on both mean and median, so a short book built from them would have "
+               "lost money.")
+        if all(pd.notna(n["loss_avg"]) and n["loss_avg"] > n["uni_avg"] and n["loss_med"] > n["uni"] for n in notes):
+            txt += " Loss-making stocks as a group were rewarded"
+            txt += (", which is exactly what the speculative SELL group bets against." if settings.sell_scope != "profitable"
+                    else ".")
+        para.append(txt + " That is a genuine result, not a bug, and the main reason short positions need tight "
+                    "size limits.")
+    else:
+        for n in notes:
+            if pd.notna(n["sell_med"]) and n["sell_med"] < n["uni"]:
+                para.append(f"For the portfolio {n['label'].lower()}, the median SELL candidate ({pct(n['sell_med'])}) "
+                            f"lagged the median firm ({pct(n['uni'])}), so the warning was right more often than not.")
+    for n in notes:
+        if not (pd.notna(n["spec"]) and n["spec_share_below"] > 0.5 and n["spec_mean"] > n["spec"]):
+            continue
+        winners = [(tk, raw, w) for tk, raw, w in n["spec_top"] if raw > max(n["uni"], 0) + 0.5]
+        if not winners:
+            continue
+        top = ", ".join(f"{tk} {raw:+.0%}" + (f" ({w:+.0%} after winsorizing)" if abs(raw - w) > 0.005 else "")
+                        for tk, raw, w in winners)
+        verb = "lifted the group's average to" if n["spec_mean"] > 0 else "pulled the group's average up to"
+        para.append(
+            f"The speculative SELL group shows the classic risk of shorting. For the portfolio {n['label'].lower()}, "
+            f"{n['spec_share_below']:.0%} of these stocks did worse than the median firm (group median "
+            f"{pct(n['spec'])}), so the screen was right about most of them, but a few extreme winners ({top}) "
+            f"{verb} {pct(n['spec_mean'])}.")
+    good = [n["label"].lower() for n in notes if pd.notna(n["q5"]) and n["q5"] > n["q1"]]
+    bad = [n["label"].lower() for n in notes if pd.notna(n["q5"]) and n["q5"] <= n["q1"]]
+    if good:
+        para.append("The value composite sorted returns in the right direction for the portfolio "
+                    + " and ".join(good) + (f", but not for the one {' and '.join(bad)}." if bad else "."))
+    elif bad:
+        para.append("The value composite did not sort returns in the right direction in any test year.")
+    para.append(
+        "Quantitative Value is built for multi-year holding periods, and value strategies have had multi-year "
+        "droughts before (for example during the late-1990s technology boom). Two 12-month windows are too short "
+        "to prove or disprove the method, so read this tab as a check on how the screen behaves, not as a forecast.")
+    st.markdown("\n\n".join(para))
+
+
 def backtest_tab() -> None:
     st.markdown(
         "**Did these rules work out of sample?** The same sidebar settings are applied to point-in-time data: "
@@ -583,32 +1122,54 @@ def backtest_tab() -> None:
         format_func=lambda v: f"${v}B", key="bt_floor",
         help="The firm list is today's (all above $1B now). Firms that were tiny at formation are only here "
              "because they grew, which biases results upward. A formation-date floor removes most of them.")
-    rows, quint = [], []
-    for snap in ("bt2024", "bt2025"):
-        bm_ = metrics_for(snap, lookback, VERSION)
-        bres, _ = run_screen(bm_, dataclasses.replace(settings, min_mcap=max(bt_floor * 1e9, settings.min_mcap)))
-        bres = bres.dropna(subset=["fwd_ret"])
+    frames = backtest_frames(bt_floor)
+    groups = ["BUY", "SELL", "SELL · profitable", "SELL · speculative", "AVOID", "HOLD"]
+    rows, quint, notes = [], [], []
+    for snap, full in frames.items():
+        bres = full.dropna(subset=["fwd_ret"]).copy()
         if bres.empty:
             continue
         lo, hi = bres["fwd_ret"].quantile([0.01, 0.99])
         bres["fwd_ret_w"] = bres["fwd_ret"].clip(lo, hi)
         spy = float(bench.loc[bench["snapshot"] == snap, "spy_ret"].iloc[0])
-        uni_med = bres["fwd_ret"].median()
-        for lab in LABEL_ORDER:
-            g_ = bres.loc[bres["label"] == lab]
+        uni_med, uni_avg = bres["fwd_ret"].median(), bres["fwd_ret_w"].mean()
+        member = {
+            "SELL · profitable": bres["sell_type"] == SELL_PROFITABLE,
+            "SELL · speculative": bres["sell_type"] == SELL_SPECULATIVE,
+        }
+        for lab in groups:
+            g_ = bres.loc[member[lab] if lab in member else bres["label"] == lab]
             rows.append({"Formation": SNAP_LABEL[snap], "Signal": lab, "Firms": len(g_),
                          "Avg return (winsorized)": g_["fwd_ret_w"].mean(), "Median return": g_["fwd_ret"].median(),
                          "Raw mean return": g_["fwd_ret"].mean(),
                          "Beat universe median": (g_["fwd_ret"] > uni_med).mean() if len(g_) else np.nan,
-                         "Universe avg (winsorized)": bres["fwd_ret_w"].mean(), "S&P 500 (SPY)": spy})
+                         "Universe avg (winsorized)": uni_avg, "S&P 500 (SPY)": spy})
         quint.append(bres.assign(Formation=SNAP_LABEL[snap]))
+        vq = bres.dropna(subset=["value_score"])
+        vq = vq.assign(_q=pd.qcut(vq["value_score"].rank(method="first"), 5, labels=False)) if len(vq) >= 5 else None
+        spec_g = bres[member["SELL · speculative"]]
+        sell_g = bres[bres["label"] == "SELL"]
+        loss_g = bres[~(bres["ebit"] > 0)]
+        buy_g = bres[bres["label"] == "BUY"]
+        notes.append({
+            "label": SNAP_LABEL[snap], "spy": spy, "uni": uni_med, "uni_avg": uni_avg,
+            "buy": buy_g["fwd_ret"].median(), "buy_avg": buy_g["fwd_ret_w"].mean(),
+            "prof": bres.loc[member["SELL · profitable"], "fwd_ret"].median(),
+            "spec": spec_g["fwd_ret"].median(), "spec_mean": spec_g["fwd_ret_w"].mean(),
+            "spec_share_below": (spec_g["fwd_ret"] < uni_med).mean() if len(spec_g) else np.nan,
+            "spec_top": spec_g.nlargest(3, "fwd_ret")[["ticker", "fwd_ret", "fwd_ret_w"]].values.tolist(),
+            "sell_avg": sell_g["fwd_ret_w"].mean(), "sell_med": sell_g["fwd_ret"].median(),
+            "loss_avg": loss_g["fwd_ret_w"].mean(), "loss_med": loss_g["fwd_ret"].median(),
+            "q1": vq.loc[vq["_q"] == 0, "fwd_ret_w"].mean() if vq is not None else np.nan,
+            "q5": vq.loc[vq["_q"] == 4, "fwd_ret_w"].mean() if vq is not None else np.nan,
+        })
     bt = pd.DataFrame(rows)
     if bt.empty:
         st.info("No firms with returns match the current filters.")
         return
     bfig = px.bar(bt, x="Signal", y="Avg return (winsorized)", color="Formation", barmode="group",
                   color_discrete_sequence=[SERIES_1, SERIES_2], text_auto=".1%",
-                  category_orders={"Signal": LABEL_ORDER},
+                  category_orders={"Signal": groups},
                   title="Average 12-month return by signal (returns winsorized at 1% / 99%)")
     bfig.update_yaxes(tickformat=".0%")
     bfig.update_layout(bargap=0.3, bargroupgap=0.08)
@@ -620,7 +1181,20 @@ def backtest_tab() -> None:
     piv = bt.pivot(index="Formation", columns="Signal", values="Avg return (winsorized)")
     if {"BUY", "SELL"} <= set(piv.columns):
         spread = (piv["BUY"] - piv["SELL"]).dropna()
-        st.markdown("**BUY minus SELL spread:** " + " · ".join(f"{k}: **{v:+.1%}**" for k, v in spread.items()))
+        st.markdown("**BUY minus SELL spread (average):** " + " · ".join(f"{k}: **{v:+.1%}**" for k, v in spread.items()))
+
+    st.markdown(f"#### The recommendation rule itself (top {RANK['n']} per side)")
+    rr = pd.DataFrame(rule_results(frames, RANK))
+    st.dataframe(rr, hide_index=True, width="stretch", column_config={
+        c: st.column_config.NumberColumn(c, format="percent")
+        for c in ("Avg long return", "Avg return of shorted stocks", "Long minus short")} | {
+        "Long picks": st.column_config.TextColumn("Long picks", width="large"),
+        "Short picks": st.column_config.TextColumn("Short picks", width="large")})
+    st.caption(f"Picks use the Recommendations tab's ranking (longs: {RANK['long'].lower()}; shorts: "
+               f"{RANK['short'].lower()}) on each formation date, before any returns are known. A short gains when "
+               "its stock falls, so a positive return for the shorted stocks is a loss on the short side. Raw, "
+               "unwinsorized returns; 'n/a' = no price history after formation.")
+    interpret_backtest(notes)
 
     st.markdown("#### Does each signal sort future returns?")
     qmetric_label = st.selectbox("Sort firms into quintiles by", [
@@ -628,8 +1202,8 @@ def backtest_tab() -> None:
         "Overvaluation score", "STA (accruals)", "SNOA", "Altman Z", "F_SCORE", "Franchise percentile",
         "Beneish M-score"])
     qcol = {"Cheapness percentile (value composite)": "value_score", "Quality percentile (quality composite)":
-            "quality_score", "Overvaluation score": "overvaluation_score", "STA (accruals)": "sta", "SNOA": "snoa",
-            "Altman Z": "altman_z", "F_SCORE": "fscore", "Franchise percentile": "franchise",
+            "quality_score", "Overvaluation score": "overvaluation_score_univ", "STA (accruals)": "sta",
+            "SNOA": "snoa", "Altman Z": "altman_z", "F_SCORE": "fscore", "Franchise percentile": "franchise",
             "Beneish M-score": "mscore"}[qmetric_label]
     q = pd.concat(quint)
     # Shuffle before ranking so ties (e.g. equal F_SCOREs) are not split by market-cap order.
@@ -663,13 +1237,13 @@ def backtest_tab() -> None:
     )
 
 
-with tabs[5]:
+with t_backtest:
     backtest_tab()
 
 # ---------------------------------------------------------------------------
 # Methodology
 # ---------------------------------------------------------------------------
-with tabs[6]:
+with t_method:
     st.markdown(f"""
 ### Process
 1. **Universe**: the {meta['n_operating']:,} largest U.S.-listed operating companies by market cap
@@ -681,8 +1255,15 @@ with tabs[6]:
    survivors (optionally every firm under the distress cutoff).
 4. **Step 3 · Price (Ch 2)**: keep the cheapest share on the value composite.
 5. **Step 4 · Quality (Ch 2, 5, 6)**: keep the best share on the quality composite with a minimum F_SCORE. → **BUY**
-6. **SELL**: most expensive share of the universe **and** at least *k* red flags. **AVOID**: cheap but removed in
-   Step 1 or 2. Everything else is **HOLD**.
+6. **SELL** (at least *k* red flags) has two groups: **Overvalued (profitable)**, firms with EBIT > 0 in the
+   most expensive share of *profitable* firms, and **Speculative (unprofitable)**, firms with an operating loss
+   last year and no multi-year record of profits in the most expensive share of the universe. **AVOID**: cheap
+   but removed in Step 1 or 2. Everything else is **HOLD**.
+7. **Recommendations**: the top *n* BUY candidates (longs) and top *n* profitable SELL candidates (shorts), plus
+   the top 3 speculative SELLs, ranked by the method chosen on the Recommendations tab: cheapness + quality,
+   the Greenblatt magic formula (rank of EBIT/TEV + rank of ROC), quality or cheapness for longs; red flags,
+   overvaluation score, Beneish M-score or accrual quality for shorts. The Backtest tab applies the same rule on
+   each formation date.
 
 ### Formulas
 """)
@@ -717,6 +1298,12 @@ Year-over-year signals require consecutive fiscal years (330-400 days apart).
   revenue differs by 3-50% (a larger gap means a different perimeter, and the year stays blank). Margin trends
   (ΔMargin, GMI, MG, MS) only compare years from the same source.
 - BM and SNOA use common equity (stockholders' equity minus preferred stock).
+- Composites tolerate one gap: franchise power needs at least 3 of its 4 parts, and the quality composite at
+  most one missing measure, so a single missing year no longer removes a firm.
+- The Beneish manipulation flag is not applied to firms with fewer than 3 years of statements (recent IPOs and
+  spin-offs), where carve-out accounting dominates the year-over-year indices.
+- Sector labels come from the Nasdaq screener, with hand corrections for a few clearly mislabeled firms
+  (e.g. PG, MO, PM and CL to Consumer Staples, TMO to Health Care).
 - Greenblatt ROC and EBIT/TEV are blank when the denominator is zero or negative, except that positive EBIT on a
   zero/negative TEV ranks as the cheapest. Ch 5 ROC treats zero/negative capital as +100% (profitable) or −99%.
 - If the company changed shape after its last 10-K, price-based ratios are blanked: latest-quarter total assets
