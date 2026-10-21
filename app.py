@@ -340,24 +340,6 @@ with st.expander("👋 How to use this app (30 seconds)", expanded=True):
 4. **Signals**: 🟢 BUY = cheap, high-quality survivors · 🔴 SELL = expensive with red flags (profitable or
    speculative) · 🟠 AVOID = cheap but failed the accounting or distress tests (value trap) · ⚪ HOLD = no signal.
 """)
-with st.expander("📖 Glossary of measures"):
-    st.markdown("""
-| Measure | Chapter | What it tells you | Better when |
-|---|---|---|---|
-| **EBIT/TEV** (earnings yield) | 2 | Operating profit per dollar of enterprise value | Higher = cheaper |
-| **B/M** (book-to-market) | 2 | Book equity per dollar of market value | Higher = cheaper |
-| **GPA** (gross profitability) | 2 | Gross profit / total assets: economic profitability | Higher |
-| **ROC** (Greenblatt) | 2 | EBIT / (net PPE + working capital) | Higher |
-| **STA** (scaled total accruals) | 3 | (Net income − cash from operations) / assets: how much profit is non-cash | Lower |
-| **SNOA** (scaled net operating assets) | 3 | Accumulated operating assets less operating liabilities: a bloated balance sheet | Lower |
-| **M-score / PROBM** (Beneish) | 3 | Probability of earnings manipulation; M > −1.78 is a warning | Lower |
-| **Altman Z** | 4 | Bankruptcy risk: < 1.81 distress, 1.81–2.99 grey, > 2.99 safe | Higher |
-| **CFOA** | 5 | Sum of the look-back years' free cash flow (8 by default) / assets | Higher |
-| **MG / MS** (margin growth / stability) | 5 | Geometric growth and stability (mean ÷ std) of gross margin | Higher |
-| **Franchise power** | 5 | Rank of ROA, ROC, CFOA and the better of MG/MS | Higher |
-| **F_SCORE** (Piotroski) | 6 | 9 pass/fail tests of profitability, leverage/liquidity and efficiency | Higher (0–9) |
-""")
-
 k = st.columns(5)
 k[0].metric("Firms screened", f"{len(res):,}")
 k[1].metric("🟢 BUY candidates", int(counts["BUY"]))
